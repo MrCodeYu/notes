@@ -1,5 +1,3 @@
-
-
 # 1. Flink核心概念和编程模型
 
 ## 1.1 flink生态的核心组件栈的分层
@@ -996,7 +994,7 @@ env.execute("test Iterator");
 
 ### 3.4.6 Window
 
-1. 所有流的编程套路
+#### 1. 所有流的编程套路
 
 - Keyed Windows
 
@@ -1027,7 +1025,7 @@ stream
 
 
 
-1. Tumbling Windows
+#### 2. Tumbling Windows
 
 ```java
 DataStream<T> input = ...;
@@ -1045,7 +1043,7 @@ input
     .<windowed transformation>(<window function>);
 ```
 
-2. Sliding Windows
+#### 3. Sliding Windows
 
 ```java
 DataStream<T> input = ...;
@@ -1069,7 +1067,7 @@ input
     .<windowed transformation>(<window function>);
 ```
 
-3. Globle Windows
+#### 4. Globle Windows
 
 ```java
 ataStream<T> input = ...;
@@ -1081,7 +1079,7 @@ input
     .<windowed transformation>(<window function>);
 ```
 
-4. Windows Function
+#### 5. Windows Function
 
 - ReduceFunction：
 
@@ -1198,7 +1196,7 @@ class wmAssigner implements AssignerWithPeriodicWatermarks<Tuple4<Long, String, 
 }
 ```
 
-5. ProcessWindowFunction
+#### 6. ProcessWindowFunction
 
 ```java
 @Test
@@ -1245,7 +1243,7 @@ public void testProcessWindowFunction() throws Exception {
 }
 ```
 
-6. ProcessWindowFunction和ReduceFunction/AggregateFunction混合使用
+#### 7. ProcessWindowFunction和ReduceFunction/AggregateFunction混合使用
 
 混合使用的意义：ProcessWindowFunction会将整个窗口所有的数据汇总到一起统一计算；在混合使用时，所有的数据现在ReduceFunction/AggregateFunction先计算一次，再将结果给ProcessWindowFunction。这样的优点在于ReduceFunction/AggregateFunction属于滚动计算，效率比全量数据汇总计算要高得多，再将汇总后的小数据给ProcessWindowFunction，很大程度减小了计算量，提高性能。
 
@@ -1318,7 +1316,7 @@ class MyProcessWindowFunction extends ProcessWindowFunction<Double, Tuple2<Strin
 }
 ```
 
-7. 各种window算法的比较
+#### 8. 各种window算法的比较
 
 | Function                                       | 优点 | 缺点 |
 | ---| ------------------- | ------------------- |
@@ -1329,9 +1327,168 @@ class MyProcessWindowFunction extends ProcessWindowFunction<Double, Tuple2<Strin
 | processWindowFunction/processAllWindowFunction | 场景全面，可以拿到窗口中所有数据，并且可以拿到context | 同上 |
 | processWindowFunction和前三混用            | 兼具高效和全面 |      |
 
+#### 9. window join
+
+window join会把两个同时间段的两个window，按照相同的key进行join。用户需要自定义JoinFunction/FlatJoinFunction。
+
+注意：
+
+（1）如果key1在stream1-window1中存在，在stream2-window1中不存在，则key1不会输出到结果中。
+
+（2）只能是相同时间的window进行join，例如只能是stream1-[0,10) join stream2-[0,10)，不能是stream1-[0,10) join stream2-[10,20)
+
+- window join的基本套路
+
+```java
+stream.join(otherStream)
+    .where(<KeySelector>)
+    .equalTo(<KeySelector>)
+    .window(<WindowAssigner>)
+    .apply(<JoinFunction>)
+```
+
+- 示例
+
+```java
+/**
+	* 需求，将stream1的班级代号关联上stream2中班级代号的中文名称
+  */
+@Test
+public void testWindowJoin() throws Exception {
+    env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
+
+    DataStream<Tuple4<Long, String, String, Double>> source = env.fromElements(
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "张三", "class1", 100.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "王五", "class1", 90.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "赵六", "class1", 60.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "李四", "class2", 96.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "李四", "class2", 99.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis() + 10000, "王八", "class1", 71.0)
+    ).assignTimestampsAndWatermarks(new wmarkAss());
+
+    DataStream<Tuple3<Long, String, String>> classInfo = env.fromElements(
+      new Tuple3<Long, String, String>(System.currentTimeMillis(), "class1", "尖子班"),
+      new Tuple3<Long, String, String>(System.currentTimeMillis(), "class2", "平行班"),
+      new Tuple3<Long, String, String>(System.currentTimeMillis() + 10000, "class2", "平行班")
+    ).assignTimestampsAndWatermarks(new wmarkAssClass());
 
 
-### 3.4.6 Event Time & WaterMarks & Lateness
+    DataStream<Tuple4<String, String, String, Double>> stuClazzInfo = source
+        .join(classInfo)
+        .where(new KeySelector<Tuple4<Long, String, String, Double>, String>() {
+            @Override
+            public String getKey(Tuple4<Long, String, String, Double> value) throws Exception {
+                return value.f2;
+            }
+        }).equalTo(new KeySelector<Tuple3<Long, String, String>, String>() {
+            @Override
+            public String getKey(Tuple3<Long, String, String> value) throws Exception {
+                return value.f1;
+            }
+        }).window(TumblingEventTimeWindows.of(Time.seconds(5)))
+        .apply(
+      new JoinFunction<Tuple4<Long, String, String, Double>, Tuple3<Long, String, String>, Tuple4<String, String, String, Double>>() {
+            @Override
+            public Tuple4<String, String, String, Double> join(Tuple4<Long, String, String, Double> first,Tuple3<Long, String, String> second)throws Exception {
+                return new Tuple4<>(first.f2, second.f2, first.f1, first.f3);
+            }
+        });
+
+    stuClazzInfo.print();
+
+    env.execute("window join");
+}
+```
+
+#### 10. Window coGroup
+
+- window cogroup 的基本套路
+
+```java
+stream.(otherStream)
+    .where(<KeySelector>)
+    .equalTo(<KeySelector>)
+    .window(<WindowAssigner>)
+    .apply(<JoinFunction>)
+```
+
+- 示例
+
+需求：chineseScore是班级语文成绩，mathScore是班级数学成绩，用cogroup求 班级-语文成绩平均分-数学成绩平均分
+
+```
+@Test
+public void testCogroup() throws Exception {
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+    DataStream<Tuple3<Long, String, Double>> chineseScore = env.fromElements(
+        new Tuple3<Long, String, Double>(System.currentTimeMillis(), "class1", 90.0),
+        new Tuple3<Long, String, Double>(System.currentTimeMillis(), "class1", 80.0),
+        new Tuple3<Long, String, Double>(System.currentTimeMillis(), "class1", 65.0),
+        new Tuple3<Long, String, Double>(System.currentTimeMillis(), "class2", 74.0),
+        new Tuple3<Long, String, Double>(System.currentTimeMillis() + 10000, "class2", 74.0)
+    ).assignTimestampsAndWatermarks(new wmarkCoGroup());
+
+    DataStream<Tuple3<Long, String, Double>> mathScore = env.fromElements(
+            new Tuple3<Long, String, Double>(System.currentTimeMillis(), "class1", 45.0),
+            new Tuple3<Long, String, Double>(System.currentTimeMillis(), "class1", 70.0),
+            new Tuple3<Long, String, Double>(System.currentTimeMillis(), "class2", 100.0)
+    ).assignTimestampsAndWatermarks(new wmarkCoGroup());
+
+    DataStream<Tuple3<String, Double, Double>> scoreCogroup = chineseScore.coGroup(mathScore)
+            .where(new KeySelector<Tuple3<Long, String, Double>, String>() {
+                @Override
+                public String getKey(Tuple3<Long, String, Double> value) throws Exception {
+                    return value.f1;
+                }
+            })
+            .equalTo(new KeySelector<Tuple3<Long, String, Double>, String>() {
+                @Override
+                public String getKey(Tuple3<Long, String, Double> value) throws Exception {
+                    return value.f1;
+                }
+            })
+            .window(TumblingEventTimeWindows.of(Time.seconds(5)))
+            .apply(new CoGroupFunction<Tuple3<Long, String, Double>, Tuple3<Long, String, Double>, Tuple3<String, Double, Double>>() {
+                @Override
+                public void coGroup(Iterable<Tuple3<Long, String, Double>> first, Iterable<Tuple3<Long, String, Double>> second, Collector<Tuple3<String, Double, Double>> out) throws Exception {
+                    Iterator<Tuple3<Long, String, Double>> chineseItr = first.iterator();
+                    Double chineseTotalScore = 0.0;
+                    Integer chineseValidScoreNum = 0;
+                    String whichClass = "";
+                    boolean classGet = false;
+                    while (chineseItr.hasNext()) {
+                        Tuple3<Long, String, Double> chineseScoreInfo = chineseItr.next();
+                        chineseTotalScore += chineseScoreInfo.f2;
+                        chineseValidScoreNum += 1;
+                        if (!classGet) {
+                            whichClass = chineseScoreInfo.f1;
+                            classGet = true;
+                        }
+                    }
+                    Double chineseAvg = (chineseTotalScore / chineseValidScoreNum);
+
+                    Iterator<Tuple3<Long, String, Double>> mathItr = second.iterator();
+                    Double mathTotalScore = 0.0;
+                    Integer mathValidScoreNum = 0;
+                    while (mathItr.hasNext()) {
+                        mathTotalScore += mathItr.next().f2;
+                        mathValidScoreNum += 1;
+                    }
+                    Double mathAvg = (mathTotalScore / mathValidScoreNum);
+                    out.collect(new Tuple3<String, Double, Double>(whichClass, chineseAvg, mathAvg));
+                }
+            });
+
+    scoreCogroup.print();
+    env.execute("execute cogroup");
+
+}
+```
+
+
+
+### 3.4.7 Event Time & WaterMarks & Lateness
 
 ```java
 public class MyWatermarks {
@@ -1463,3 +1620,228 @@ public class MyWatermarks {
 }
 ```
 
+### 3.6.8 利用broadcast state动态获取数据
+
+主类，数据源读取，创建广播流、时间流，连接广播流-时间流。
+
+```java
+@Test
+public void testBroadcastState() throws Exception {
+
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+    // timestamp,id 事件流
+    DataStreamSource<String> customInStream = env.socketTextStream("localhost", 9999);
+
+    // custom data Tuple2<Long, String>
+    SingleOutputStreamOperator<Tuple2<Long, String>> customProcessStream =
+        customInStream.process(new ProcessFunction<String, Tuple2<Long, String>>() {
+            @Override
+            public void processElement(String customData, Context ctx,
+                                       Collector<Tuple2<Long, String>> out) throws Exception {
+
+                String[] splited = customData.split(",");
+                out.collect(new Tuple2<Long, String>(Long.parseLong(splited[0]), splited[1]));
+            }
+        });
+
+    // mysql data Tuple2<String, Integer>
+    DataStreamSource<HashMap<String, Tuple2<String, Integer>>> mysqlStream =
+            env.addSource(new MysqlSource());
+    mysqlStream.print();
+
+    /*
+      (1) 先建立MapStateDescriptor
+      MapStateDescriptor定义了状态的名称、Key和Value的类型。
+      这里，MapStateDescriptor中，key是Void类型，value是Map<String, Tuple2<String,Integer>>类型。
+
+      是mysql data的类型
+     */
+    MapStateDescriptor<Void, Map<String, Tuple2<String, Integer>>> configDescriptor =
+            new MapStateDescriptor<>("config", Types.VOID,
+                    Types.MAP(Types.STRING, Types.TUPLE(Types.STRING, Types.INT)));
+
+    /*
+      (2) 将mysql的数据流广播，形成BroadcastStream，并添加上mysql data的类型
+     */
+    BroadcastStream<HashMap<String, Tuple2<String, Integer>>> broadcastConfigStream =
+            mysqlStream.broadcast(configDescriptor);
+
+    //(3)事件流和广播的配置流连接，形成BroadcastConnectedStream
+    BroadcastConnectedStream<Tuple2<Long, String>, HashMap<String, Tuple2<String, Integer>>> connectedStream =
+            customProcessStream.connect(broadcastConfigStream);
+
+    //(4)对BroadcastConnectedStream应用process方法，根据配置(规则)处理事件
+    SingleOutputStreamOperator<Tuple4<Long, String, String, Integer>> resultStream =
+            connectedStream.process(new CustomBroadcastProcessFunction());
+
+    resultStream.print();
+
+    env.execute("testBroadcastState");
+
+}
+```
+
+广播流
+```java
+public class CustomBroadcastProcessFunction extends
+        BroadcastProcessFunction<Tuple2<Long, String>,
+                HashMap<String, Tuple2<String, Integer>>,
+                Tuple4<Long, String, String, Integer>> {
+
+    /**定义MapStateDescriptor*/
+    MapStateDescriptor<Void, Map<String, Tuple2<String,Integer>>> configDescriptor =
+            new MapStateDescriptor<>("config", Types.VOID,
+                    Types.MAP(Types.STRING, Types.TUPLE(Types.STRING, Types.INT)));
+
+    /**
+     * 读取状态，并基于状态，处理事件流中的数据
+     * 在这里，从上下文中获取状态，基于获取的状态，对事件流中的数据进行处理
+     * @param value 事件流中的数据
+     * @param ctx 上下文
+     * @param out 输出零条或多条数据
+     * @throws Exception
+     */
+    @Override
+    public void processElement(Tuple2<Long, String> value, ReadOnlyContext ctx,
+                               Collector<Tuple4<Long, String, String, Integer>> out) throws Exception {
+
+        //nc -l 中的用户ID
+        String userID = value.f1;
+        System.out.println("userid: " + userID);
+
+        //获取状态-mysql
+        ReadOnlyBroadcastState<Void, Map<String, Tuple2<String, Integer>>> broadcastState =
+                ctx.getBroadcastState(configDescriptor);
+        Map<String, Tuple2<String, Integer>> mysqlDataInfo = broadcastState.get(null);
+        System.out.println("广播内容： " + mysqlDataInfo);
+
+        //配置中有此用户，则在该事件中添加用户的userName、userAge字段。
+        //配置中没有此用户，则丢弃
+        Tuple2<String, Integer> userInfo = mysqlDataInfo.get(userID);
+        System.out.println(mysqlDataInfo);
+        if(userInfo!=null){
+            out.collect(new Tuple4<>(value.f0, value.f1, userInfo.f0, userInfo.f1));
+        }else{
+            System.out.println("没有该用户 " + userID);
+        }
+
+    }
+
+    /**
+     * 处理广播流中的每一条数据，并更新状态
+     * @param value 广播流中的数据
+     * @param ctx 上下文
+     * @param out 输出零条或多条数据
+     * @throws Exception
+     */
+    @Override
+    public void processBroadcastElement(HashMap<String, Tuple2<String, Integer>> value, Context ctx, Collector<Tuple4<Long, String, String, Integer>> out) throws Exception {
+
+        // 获取状态
+        BroadcastState<Void, Map<String, Tuple2<String, Integer>>> broadcastState = ctx.getBroadcastState(configDescriptor);
+
+        //清空状态
+        broadcastState.clear();
+
+        //更新状态
+        broadcastState.put(null,value);
+    }
+}
+```
+
+Customer MySQL source stream
+
+```java
+public class MysqlSource extends RichSourceFunction<HashMap<String, Tuple2<String, Integer>>> {
+
+    private String jdbcUrl = "jdbc:mysql://127.0.0.1:3306/test";
+    private String user = "root";
+    private String passwd = "root";
+    private Integer secondInterval = 5;
+
+    private Connection conn = null;
+    private PreparedStatement pst1 = null;
+    private PreparedStatement pst2 = null;
+
+    private boolean isRunning = true;
+    private boolean isFirstTime = true;
+
+    public MysqlSource(){}
+
+    public MysqlSource(String jdbcUrl, String user, String passwd,Integer secondInterval) {
+        this.jdbcUrl = jdbcUrl;
+        this.user = user;
+        this.passwd = passwd;
+        this.secondInterval = secondInterval;
+    }
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        super.open(parameters);
+        Class.forName("com.mysql.jdbc.Driver");
+        conn = DriverManager.getConnection(jdbcUrl, user, passwd);
+
+    }
+
+    @Override
+    public void run(SourceContext<HashMap<String, Tuple2<String, Integer>>> out) throws Exception {
+        String staticStatusSql = "SELECT up_status FROM my_status";
+        String sql = "SELECT id,name,age FROM account";
+
+        pst1 = conn.prepareStatement(staticStatusSql);
+        pst2 = conn.prepareStatement(sql);
+
+        HashMap<String, Tuple2<String, Integer>> mysqlData = new HashMap();
+
+        while (isRunning){
+
+            ResultSet rs1 = pst1.executeQuery();
+            Boolean isUpdateStatus = false;
+            while(rs1.next()){
+                isUpdateStatus = (rs1.getInt("up_status") == 1);
+            }
+            System.out.println();
+            System.out.println("isUpdateStatus:  " + isUpdateStatus + " isFirstTime: " + isFirstTime);
+
+            if(isUpdateStatus || isFirstTime){
+                ResultSet rs2 = pst2.executeQuery();
+                while(rs2.next()){
+                    int id = rs2.getInt("id");
+                    String name = rs2.getString("name");
+                    int age = rs2.getInt("age");
+                    mysqlData.put(id + "", new Tuple2<String, Integer>(name, age));
+                }
+                isFirstTime = false;
+                System.out.println("我查了一次mysql，数据是： " + mysqlData);
+                out.collect(mysqlData);
+            }else{
+                System.out.println("这次没查mysql");
+            }
+
+            Thread.sleep(secondInterval * 1000);
+        }
+    }
+
+    @Override
+    public void cancel() {
+
+        isRunning = false;
+    }
+
+    @Override
+    public void close() throws Exception {
+        super.close();
+        if(conn != null){
+            conn.close();
+        }
+        if(pst1 != null){
+            pst1.close();
+        }
+        if(pst2 != null){
+            pst2.close();
+        }
+    }
+}
+```
