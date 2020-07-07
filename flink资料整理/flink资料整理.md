@@ -750,7 +750,7 @@ Please see [operators](https://ci.apache.org/projects/flink/flink-docs-release-1
 | **Window** <br />KeyedStream→WindowedStream                  | 窗口函数，Windows对KeyedStreams起作用。 dataStream.keyBy(0).window(TumblingEventTimeWindows.of(Time.seconds(5))); // Last 5 seconds of data    ` |
 | **WindowAll** <br />DataStream→AllWindowedStream             | 窗口函数，作用同window。windowAll会把所有的event放到一个task中。<br />`dataStream.windowAll(TumblingEventTimeWindows.of(Time.seconds(5)));   ` |
 | **Window Apply** <br />WindowedStream → DataStream AllWindowedStream→DataStream | apply方法给window函数添加用户自定义的逻辑，如果是WindowAll，则需实现AllWindowFunction。<br /><img src="./image-20200703145256874.png" alt="image-20200703145256874" style="zoom:100%;" /> |
-| **Window Apply** <br />WindowedStream → DataStream AllWindowedStream→DataStream | apply方法给window函数添加用户自定义的逻辑，如果是WindowAll，则需实现AllWindowFunction。<br /><img src="./image-20200703145256874.png" alt="image-20200703145256874" style="zoom:100%;" /> |
+| **Window Process** <br />WindowedStream → DataStream AllWindowedStream→DataStream | 用apply的地方都可以用process，process方法在参数中多了context的信息。<br /><img src="./image-20200707091026104.png" alt="image-20200707091026104" style="zoom:100%;" /> |
 | **Window Reduce** WindowedStream → DataStream                | 将reduce函数作用于窗口，返回一个reduce的值。<br />![image-20200706164432587](./image-20200706164432587.png) |
 | **Window Fold**<br />WindowedStream → DataStream             | 将fold函数作用于window    `                                  |
 | **Aggregations on windows** WindowedStream → DataStream      | 作用于窗口函数的函数，min和minBy的区别是，min只返回最小值，minBy返回最小值那一整条记录<br />`windowedStream.sum(0);`<br />`windowedStream.sum("key")`;<br />`windowedStream.min(0);`<br />`windowedStream.min("key");`<br />` windowedStream.max(0);<br />`<br />`windowedStream.max("key");<br />`<br />`windowedStream.minBy(0);` <br />`windowedStream.minBy("key"); `<br />`windowedStream.maxBy(0); `<br />`windowedStream.maxBy("key");    ` |
@@ -896,7 +896,49 @@ input
 
 4. Windows Function
 
-- ReduceFunction：见[3.4.5 Operator章节]()
+- ReduceFunction：
+
+```java
+@Test
+public void testReduceFunction() throws Exception {
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+    DataStreamSource<Tuple4<Long, String, String, Double>> source =
+        env.fromElements(
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "张三", "class1", 100.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "王五", "class1", 90.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "赵六", "class1", 60.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "李四", "class2", 96.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis()+10000, "王八", "class1", 71.0)
+        );
+
+    DataStream<Tuple2<String, Double>> classScore = source.assignTimestampsAndWatermarks(new wmarkAss())
+        .keyBy(new KeySelector<Tuple4<Long, String, String, Double>, String>() {
+            @Override
+            public String getKey(Tuple4<Long, String, String, Double> value) throws Exception {
+                return value.f2;
+            }
+        }).window(TumblingEventTimeWindows.of(Time.seconds(5)))
+        .reduce(new ReduceFunction<Tuple4<Long, String, String, Double>>() {
+            @Override
+            public Tuple4<Long, String, String, Double> reduce(Tuple4<Long, String, String, Double> first, Tuple4<Long, String, String, Double> second) throws Exception {
+                return new Tuple4<Long, String, String, Double>(0L, "", second.f2, first.f3 + second.f3);
+            }
+        })
+        .map(new MapFunction<Tuple4<Long, String, String, Double>, Tuple2<String, Double>>() {
+
+            @Override
+            public Tuple2<String, Double> map(Tuple4<Long, String, String, Double> value) throws Exception {
+                return new Tuple2<String, Double>(value.f2, value.f3) ;
+            }
+        });
+
+    classScore.print();
+
+    env.execute("class avg");
+}
+```
+
 -  AggregateFunction：求各班级平均分
 
 ```java
@@ -969,5 +1011,268 @@ class wmAssigner implements AssignerWithPeriodicWatermarks<Tuple4<Long, String, 
 }
 ```
 
+5. ProcessWindowFunction
+
+```java
+@Test
+public void testProcessWindowFunction() throws Exception {
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+    DataStreamSource<Tuple4<Long, String, String, Double>> source =
+            env.fromElements(
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "张三", "class1", 100.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "李四", "class2", 96.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "王五", "class1", 90.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "赵六", "class1", 60.0),
+      new Tuple4<Long, String, String, Double>(System.currentTimeMillis()+10000, "王八", "class1", 71.0)
+            );
+
+    DataStream<Tuple3<String, Double, String>> classAvg = source.assignTimestampsAndWatermarks(new wmarkAss())
+        .keyBy(new KeySelector<Tuple4<Long, String, String, Double>, String>() {
+            @Override
+            public String getKey(Tuple4<Long, String, String, Double> value) throws Exception {
+                return value.f2;
+            }
+        })
+        .window(TumblingEventTimeWindows.of(Time.seconds(5)))
+        .process(new ProcessWindowFunction<Tuple4<Long, String, String, Double>, Tuple3<String, Double, String>, String, TimeWindow>() {
+            @Override
+            public void process(String key, Context context, Iterable<Tuple4<Long, String, String, Double>> elements, Collector<Tuple3<String, Double, String>> out) throws Exception {
+                Double totalScore = 0.0;
+                Integer studentNum = 0;
+                Iterator<Tuple4<Long, String, String, Double>> stuInfos = elements.iterator();
+                while (stuInfos.hasNext()) {
+                    Tuple4<Long, String, String, Double> stuInfo = stuInfos.next();
+                    totalScore += stuInfo.f3;
+                    studentNum += 1;
+                }
+
+                String windowInfo = context.window().getStart() + "_" + context.window().getEnd();
+                out.collect(new Tuple3<String, Double, String>(key, totalScore / studentNum, windowInfo));
+            }
+        });
+
+    classAvg.print();
+
+    env.execute("class avg");
+}
+```
+
+6. ProcessWindowFunction和ReduceFunction/AggregateFunction混合使用
+
+混合使用的意义：ProcessWindowFunction会将整个窗口所有的数据汇总到一起统一计算；在混合使用时，所有的数据现在ReduceFunction/AggregateFunction先计算一次，再将结果给ProcessWindowFunction。这样的优点在于ReduceFunction/AggregateFunction属于滚动计算，效率比全量数据汇总计算要高得多，再将汇总后的小数据给ProcessWindowFunction，很大程度减小了计算量，提高性能。
+
+```java
+@Test
+public void testProcessFuncCombieAggFunc() throws Exception {
+
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+    DataStreamSource<Tuple4<Long, String, String, Double>> source =
+        env.fromElements(
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "张三", "class1", 100.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "王五", "class1", 90.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "赵六", "class1", 60.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "李四", "class2", 96.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "李四", "class2", 99.0),
+        new Tuple4<Long, String, String, Double>(System.currentTimeMillis()+10000, "王八", "class1", 71.0)
+        );
+
+    DataStream<Tuple2<String, Double>> avgScore = source.assignTimestampsAndWatermarks(new wmarkAss())
+        .keyBy(new KeySelector<Tuple4<Long, String, String, Double>, String>() {
+            @Override
+            public String getKey(Tuple4<Long, String, String, Double> value) throws Exception {
+                return value.f2;
+            }
+        })
+        .window(TumblingEventTimeWindows.of(Time.seconds(6)))
+        .aggregate(new MyAggFunction(), new MyProcessWindowFunction());
+
+    avgScore.print();
+
+    env.execute("test combie");
+
+}
+
+class MyAggFunction implements AggregateFunction<Tuple4<Long,String,String,Double>, Tuple2<Double, Double>, Double>{
+
+    @Override
+    public Tuple2<Double, Double> createAccumulator() {
+        return new Tuple2<>(0.0, 0.0);
+    }
+
+    @Override
+    public Tuple2<Double, Double> add(Tuple4<Long, String, String, Double> value, Tuple2<Double, Double> accumulator) {
+        return new Tuple2<>(accumulator.f0 + value.f3, accumulator.f1 + 1);
+    }
+
+    @Override
+    public Double getResult(Tuple2<Double, Double> accumulator) {
+        return accumulator.f0 / accumulator.f1;
+    }
+
+    @Override
+    public Tuple2<Double, Double> merge(Tuple2<Double, Double> a, Tuple2<Double, Double> b) {
+        return new Tuple2<Double, Double>(a.f0 + b.f0, a.f1 + b.f1);
+    }
+}
+
+class MyProcessWindowFunction extends ProcessWindowFunction<Double, Tuple2<String, Double>, String, TimeWindow> {
+
+    @Override
+    public void process(String key, Context context, Iterable<Double> elements, Collector<Tuple2<String, Double>> out) throws Exception {
+        Iterator<Double> classAvg = elements.iterator();
+        Double maxScore = 0.0;
+        while(classAvg.hasNext()){
+            maxScore = Math.max(classAvg.next(), maxScore);
+        }
+        out.collect(new Tuple2<>(key, maxScore));
+    }
+}
+```
+
+7. 各种window算法的比较
+
+| Function                                       | 优点 | 缺点 |
+| ---| ------------------- | ------------------- |
+| ReduceFunction            | 更高效，因为在每个窗口中滚动增量计算（增量聚     合）。 |场景覆盖不全，无法拿到全部窗口数据|
+| AggregateFunction(max,min,maxby,minby)               | 同上 |同上|
+| FoldFunction（不推荐）            | 同上 | 同上 |
+| windowFunction/allWindowFunction            | 场景全面，可以拿到窗口中所有数据 | 效率相对于增量聚合低一些，因为会把所有数据缓存后进行计算；都可以和增量聚合混合使用 |
+| processWindowFunction/processAllWindowFunction | 场景全面，可以拿到窗口中所有数据，并且可以拿到context | 同上 |
+| processWindowFunction和前三混用            | 兼具高效和全面 |      |
+
+
+
 ### 3.4.6 Event Time & WaterMarks & Lateness
+
+```java
+public class MyWatermarks {
+
+    public static void main(String[] args) throws Exception {
+
+//        The interval (every n milliseconds) in which the watermark will be generated is defined via ExecutionConfig.setAutoWatermarkInterval(...).
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+        DataStream<String> instream = env.socketTextStream("localhost", 9000, "\n");
+
+//        List<String> data = new ArrayList<>();
+//        data.add("1487225041000,001");
+//        data.add("1487225049000,001");
+//        data.add("1487225053000,001");
+//        data.add("1487225046000,001");
+//        data.add("1487225041000,001");
+//        data.add("1487225057000,001");
+//        data.add("1487225043000,001");
+//        data.add("1487225058000,001");
+//        data.add("1487225049000,001");
+//        DataStream<String> instream = env.fromCollection(data);
+
+        // 收集超过watermark和lateness的数据
+        final OutputTag<String> lateOutputTag = new OutputTag<String>("late-data"){};
+
+        DataStream<Tuple4<String, Long, Long, Long>> process =
+                instream.assignTimestampsAndWatermarks(new TestPeriodicWatermarkerAssigner())
+                .keyBy(new KeySelector<String, String>() {
+                    @Override
+                    public String getKey(String s) throws Exception {
+                        return s.split(",")[1];
+                    }
+                  // 设置10s的滚动窗口
+                }).window(TumblingEventTimeWindows.of(Time.seconds(10)))
+          				// 设置5s的允许延迟时间
+                .allowedLateness(Time.seconds(5))
+          				// 将所有迟到的数据放到lateOutputTag
+                .sideOutputLateData(lateOutputTag)
+                .process(new ProcessWindowFunction<String, Tuple4<String, Long, Long, Long>, String, TimeWindow>() {
+                    @Override
+                    public void process(String s, Context context, Iterable<String> windowData,
+                                        Collector<Tuple4<String, Long, Long, Long>> out) throws Exception {
+                        Iterator<String> iterator = windowData.iterator();
+                        while (iterator.hasNext()) {
+                            long winStart = context.window().getStart();
+                            long winEnd = context.window().getEnd();
+                            String next = iterator.next();
+                            System.out.println("window watermark:" + context.currentWatermark());
+                            out.collect(new Tuple4<>(next.split(",")[1],
+                                    Long.parseLong(next.split(",")[0]), winStart, winEnd));
+                        }
+                    }
+                });
+
+      	// 获取所有迟到的数据
+        DataStream<String> lateDatas = process.getSideOutput(lateOutputTag);
+
+      	// 正常数据处理
+        DataStream<String> map1 = process.map(new MapFunction<Tuple4<String,Long, Long, Long>, String>() {
+
+            @Override
+            public String map(Tuple4<String, Long, Long, Long> data) throws Exception {
+                return "winStart: " + data.f2 + ", winEnd: " + data.f3 + ", current data time : " + data.f1 + ", data content : " + data.f0;
+            }
+        });
+
+      	// 延迟的数据处理
+        DataStream<String> map2 = lateDatas.map(new MapFunction<String, String>() {
+
+            @Override
+            public String map(String s) throws Exception {
+                return "late----" + s;
+            }
+        });
+
+        map1.print();
+        map2.print();
+
+        env.execute("test allowed lateness");
+
+    }
+
+  // 自定义 PunctuatedWatermarks
+    private static class TestPunctuatedWatermarkerAssigner implements AssignerWithPunctuatedWatermarks<String> {
+
+        @Nullable
+        @Override
+        public Watermark checkAndGetNextWatermark(String lastElement, long extractedTimestamp) {
+            Watermark watermark = new Watermark(extractedTimestamp);
+            System.out.println("checkAndGetNextWatermark: " + watermark);
+            return watermark;
+        }
+
+        @Override
+        public long extractTimestamp(String element, long previousElementTimestamp) {
+
+            String eventTime = element.split(",")[0];
+            return Long.parseLong(eventTime);
+        }
+    }
+
+  // 自定义 PeriodicWatermarks
+    private static class TestPeriodicWatermarkerAssigner implements AssignerWithPeriodicWatermarks<String>{
+
+        private final long maxOutOfOrderness = 3000; // 10 seconds
+
+        private long currentMaxTimestamp;
+
+        @Nullable
+        @Override
+        public Watermark getCurrentWatermark() {
+            return new Watermark(currentMaxTimestamp - maxOutOfOrderness);
+        }
+
+        @Override
+        public long extractTimestamp(String data, long prevoisEventTimestamp) {
+
+            String eventTime = data.split(",")[0];
+            long timestamp = Long.parseLong(eventTime);
+
+            currentMaxTimestamp = Math.max(currentMaxTimestamp, timestamp);
+            System.out.println("data event time: " + eventTime + ", watermark:" + getCurrentWatermark());
+            return timestamp;
+        }
+    }
+}
+```
 
