@@ -114,7 +114,131 @@ windows Assigners定义了元素如何分配到一个窗口或多个。代码中
 
 - 自定义window
 
+5. 触发器 Trigger
 
+- 触发器决定窗口中的数据何时被处理
+- 每个windowAssginer都实现了触发器，如果默认触发器不能满足需求可以自定义
+- 触发器状态：
+
+```java
+/**
+	 * No action is taken on the window.
+	 * 不操作
+	 */
+	CONTINUE(false, false),
+
+	/**
+	 * {@code FIRE_AND_PURGE} evaluates the window function and emits the window
+	 * result.
+	 * 触发计算后清除window中数据
+	 */
+	FIRE_AND_PURGE(true, true),
+
+	/**
+	 * On {@code FIRE}, the window is evaluated and results are emitted.
+	 * The window is not purged, though, all elements are retained.
+	 * 触发窗口计算，但窗口数据不会被清除
+	 */
+	FIRE(true, false),
+
+	/**
+	 * All elements in the window are cleared and the window is discarded,
+	 * without evaluating the window function or emitting any elements.
+	 * 窗口中所有数据被丢弃并且不会计算
+	 */
+	PURGE(false, true);
+```
+
+- 常用默认触发器
+
+EventTimeTrigger：当EventTIme作为时间时，每个watermarks通过窗口end时间时，EventTimeTrigger就会触发。例如在SlidingEventTimeWindows/TumblingEventTimeWindows中默认都是EventTimeTrigger
+
+```java
+@Override
+public TriggerResult onElement(Object element, long timestamp, TimeWindow window, TriggerContext ctx) throws Exception {
+   if (window.maxTimestamp() <= ctx.getCurrentWatermark()) {
+      // if the watermark is already past the window fire immediately
+      return TriggerResult.FIRE;
+   } else {
+      ctx.registerEventTimeTimer(window.maxTimestamp());
+      return TriggerResult.CONTINUE;
+   }
+}
+```
+
+NeverTrigger：GlobleWindow的默认trigger，用不触发，所以GlobleWindow必须自定义trigger。
+
+- 自定义Trigger
+
+继承Trigger类，并重写以下方法，代码参考EventTimeTrigger：
+
+```java
+public abstract TriggerResult onElement(T element, long timestamp, W window, TriggerContext ctx) throws Exception;
+
+/**
+ * Called for every element that gets added to a pane. The result of this will determine
+ * whether the pane is evaluated to emit results.
+ * 窗口中每来一个元素都会调用
+ */
+	public abstract TriggerResult onElement(T element, long timestamp, W window, TriggerContext ctx) throws Exception;
+
+
+/**
+ * Called when a processing-time timer that was set using the trigger context fires.
+ * 使用processing-time，并且注册的定时器启动
+ */
+public abstract TriggerResult onProcessingTime(long time, W window, TriggerContext ctx) throws Exception;
+
+/**
+ * Called when an event-time timer that was set using the trigger context fires.
+ * 使用event-time，并且注册的定时器启动
+ */
+public abstract TriggerResult onEventTime(long time, W window, TriggerContext ctx) throws Exception;
+
+/**
+ * Called when several windows have been merged into one window by the
+ * {@link org.apache.flink.streaming.api.windowing.assigners.WindowAssigner}.
+ * 合并多个window时
+ */
+public void onMerge(W window, OnMergeContext ctx) throws Exception {
+   throw new UnsupportedOperationException("This trigger does not support merging.");
+}
+
+/**
+ * Clears any state that the trigger might still hold for the given window. This is called
+ * when a window is purged. Timers set using {@link TriggerContext#registerEventTimeTimer(long)}
+ * and {@link TriggerContext#registerProcessingTimeTimer(long)} should be deleted here as
+ * well as state acquired using {@link TriggerContext#getPartitionedState(StateDescriptor)}.
+ */
+public abstract void clear(W window, TriggerContext ctx) throws Exception;
+```
+
+6. 驱逐器 Evictor
+
+- 驱逐器作用：类似于filter，对窗口中数据过滤，windowAssginer默认没有驱逐器
+- 驱逐器可分为窗口触发后，计算前驱逐 和 计算后驱逐
+
+```java
+/**
+ * Optionally evicts elements. Called before windowing function.
+ * 当window计算前，先驱逐元素
+ */
+void evictBefore(Iterable<TimestampedValue<T>> elements, int size, W window, EvictorContext evictorContext);
+
+/**
+ * Optionally evicts elements. Called after windowing function.
+ * 在窗口计算后，对结果进行驱逐
+ */
+void evictAfter(Iterable<TimestampedValue<T>> elements, int size, W window, EvictorContext evictorContext);
+```
+
+- 内置驱逐器
+
+countEvictor：窗口中只保留特定数量个元素。
+
+TimeEvictor：使用interval（毫秒数）作为参数，对于一个窗口的所有元素，找出max_timestamp，并驱逐所有max_timestamp-interval的event。
+
+注意：Flink只能保证窗口有序，并不能保证窗口中event有序，所以countEvent不一定保留的是timestamp最大的那一批数据。
 
 ## 1.7 Flink的三种Time
 
@@ -174,9 +298,72 @@ WaterMarks是Flink衡量EventTime到什么情况的机制，WaterMarks是数据�
 
 ## 1.11 延迟处理
 
-延迟处理机制，允许当EventTime小于WaterMarks时，依旧触发计算，但时间不宜太长，
+- 延迟处理机制，允许当EventTime小于WaterMarks时，依旧触发计算，但时间不宜太长。
 
-## 1.8 Stateful Operations
+## 1.12 关于watermarks和allowed lateness的机制总结
+
+默认情况下：当watermark过了窗口最后时间，晚到的元素会被丢弃，但flink允许为窗口设置一个最大的延时。
+
+当数据已经过了watermark的最后时间，但还未到watermark最后时间的延时时间，那么元素仍然可以导致窗口再次触发，例如使用EventTimeTrigger时。
+
+flink watermark和allowed lateness的触发机制
+
+（1）当watermark>=窗口的结束时间 ， 第一次触发
+
+（2）当watermark<窗口的结束时间+allowed lateness的时间，每条数据来都触发，触发时会用窗口中所有数据进行计算
+
+（3）当watermark>=窗口结束时间+allowed lateness的时间，销毁窗口。迟到数据会到**final** OutputTag<String> lateOutputTag = **new** OutputTag<String>(**"late-data"**){}; 
+
+（4）延迟数据在lateOutputTag中，取出后实际是个DataStream，如果不加窗口处理，就和普通流一样，来一条走一条；也可以加窗口处理也和普通流一样
+
+（5）如果window里有多个key，那么会生成多个并行的分片，但触发条件还是watermark>=窗口结束时间和key无关。
+
+例如数据
+
+1487225041000,001
+
+1487225049000,001
+
+1487225053000,001
+
+1487225046000,001
+
+1487225042000,001
+
+1487225057000,001
+
+1487225043000,001
+
+1487225058000,001
+
+1487225049000,001
+
+会形成以下触发形式：
+
+假定窗口为滚动窗口，并设置watermark 3s, lateness 5s, window 10s, PeriodicWatermarks
+
+| event_time    | Event_time时间 | Watermarks    | watermarks时间 | [window_start | Window_end) | 触发                  |
+| ------------- | -------------- | ------------- | -------------- | ------------- | ----------- | --------------------- |
+| 1487225041000 | 14:04:01       | 1487225038000 | 14:03:58       | 14:04:00      | 14:04:10    | 不触发                |
+| 1487225049000 | 14:04:09       | 1487225046000 | 14:04:06       | 14:04:00      | 14:04:10    | 不触发                |
+| 1487225053000 | 14:04:13       | 1487225050000 | 14:04:10       | 14:04:10      | 14:04:20    | 第一次触发[00:10)窗口 |
+| 1487225046000 | 14:04:06       | 1487225050000 | 14:04:10       | 14:04:00      | 14:04:10    | 延迟计算触发[00:10)   |
+| 1487225042000 | 14:04:02       | 1487225050000 | 14:04:10       | 14:04:00      | 14:04:10    | 延迟计算触发[00:10)   |
+| 1487225057000 | 14:04:17       | 1487225054000 | 14:04:14       | 14:04:10      | 14:04:20    | 不触发                |
+| 1487225043000 | 14:04:03       | 1487225054000 | 14:04:14       | 14:04:00      | 14:04:10    | 延迟计算触发[00:10)   |
+| 1487225058000 | 14:04:18       | 148722505500  | 14:04:15       | 14:04:10      | 14:04:20    | 丢弃窗口[00:10)       |
+| 1487225049000 | 14:04:09       | 148722505500  | 14:04:15       | 14:04:00      | 14:04:10    | 放入late队列          |
+
+根据以上结果，结论如下：
+
+1. event是根据自身EventTime分配窗口
+2. PeriodicWatermarks watermarks总是递增，不会因为延迟数据来了，watermark减小
+3. 窗口第一次触发是watermarks=window_endTime
+4. 窗口延迟触发是watermarks在[window_endTime,window_endTime+lateness]
+5. 窗口数据被清除是watermarks>=window_endTime+lateness
+6. 因为watermarks=EventTime-watermark，所以窗口会在EventTime=window_endTime+lateness+watermark时被删除
+
+## 1.13 Stateful Operations
 
 1. 状态
 
@@ -202,7 +389,7 @@ The exact data structures in which the key/values indexes are stored depends on 
 
 
 
-## 1.9 Checkpoint
+## 1.14 Checkpoint
 
 1. checkpoint
 
@@ -221,7 +408,7 @@ The exact data structures in which the key/values indexes are stored depends on 
 
 
 
-## 1.10 Savepoint
+## 1.15 Savepoint
 
 1. 功能和checkpoint相同，用于存储某个时刻task的状态
 2. 两种触发方式
