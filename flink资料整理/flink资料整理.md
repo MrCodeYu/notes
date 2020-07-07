@@ -72,39 +72,109 @@ rebalance() -> repartition randomly
 
 ## 1.6 windows
 
-1. count windows
+1. windows将流分割成小块用于计算。主要分成**Keyed Windows**和**Non-Keyed Windows**
+
+2. windows的生命周期
+
+- 创建：当窗口的第一个元素到达时，创建窗口
+- 销毁：当时间（EventTime/ProcessingTime）超过了【窗口最大时间+允许延迟时间】，窗口清除。例如定义5分钟窗口，允许延迟1分钟，那么12:06:01时刻会清除12:00:00-12:06:00的窗口
+- 触发器Trigger：设定条件，指定Windows在什么条件下触发。触发器还可以在Windows生命周期内删除窗口内数据（注意不会清除元数据，数据依然可以进入窗口）
+- Windows Function：作用于Windows的处理逻辑
+- 驱逐器Evictor：相当于Filter，过滤窗口中的数据。分为触发后，在计算前过滤和在计算后过滤。
+
+3. Keyed Windows和Non-Keyed Windows
+
+- 从直观上看，有keyBy是Keyed Windows，没有就是Non-Keyed Windows
+- Keyed Windows允许并行执行任务，相同key的元素会被发送到同一个task
+- Non-Keyed Windows所有元素会在一个task中，并行度1
+
+4. Windows Assigners
+
+windows Assigners定义了元素如何分配到一个窗口或多个。代码中是window(...)/windowAll()中调用决定WindowAssigner
+
+- count windows
 
    根据消息的条数来划分的窗口
 
-2. Time windows
+- Time windows
 
    `Tumbling window` 翻滚窗口
 
+   <img src="./image-20200706162159164.png" alt="image-20200706162159164" style="zoom: 33%;" />
+
    `Sliding window` 滑动窗口
+
+   <img src="./image-20200706163333483.png" alt="image-20200706163333483" style="zoom:33%;" />
 
    `Session Window` 
 
-3. 自定义window
+   `Globle window`：所有相同key的element会被分配到同一个globle window，默认trigger是NeverTrigger，所以用户必须自定义触发器，否则不会进行任何计算
+
+   <img src="./image-20200706163933539.png" alt="image-20200706163933539" style="zoom:33%;" />
+
+- 自定义window
 
 
 
-## 1.7 各种Time
+## 1.7 Flink的三种Time
 
 1. Event Time 事件时间
 
-   event产生的时间，比如hdfs日志里的时间
+- event产生的时间，比如hdfs日志里的时间
+- 配合watermark，用于处理乱序数据
+- 优势：用于处理乱序数据情况，都能给出正确结果
+- 缺点：处理无序数据时，性能会受到影响
 
 2. Ingestion Time 摄取时间
 
-   日志进入到flink source的时间
+- 日志进入到flink source的时间
+- 不需要指定watermark
+- 缺点：不能处理乱序和延迟数据
 
 3. Processing Time 处理时间
 
-   日志被算子处理的时间
+- 日志被算子处理的时间，即当前主机的时间
+- 不需要流和当前机器协调
+- 优势：性能最佳，延迟最低
+- 缺点：不能处理延迟数据
 
 ![image-20200630094401958](./image-20200630094401958.png)
 
+在代码中设置时间：
 
+```java
+final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
+// env.setStreamTimeCharacteristic(TimeCharacteristic.IngestionTime);
+// env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+```
+
+## 1.9 WaterMarks
+
+WaterMarks是Flink衡量EventTime到什么情况的机制，WaterMarks是数据流的一部分，携带了时间戳。Watermark(t))声明EventTime已在该流中达到时间t，这意味着不应再有时间戳t'<= t的event（即时间戳早于或等于WaterMarks的event）。
+
+- WaterMarks在顺序流中的情况：在顺序流中，仅仅是周期性的打上WaterMarks的标签
+
+<img src="./image-20200706152804502.png" alt="image-20200706152804502" style="zoom:50%;" />
+
+- WaterMarks在乱序流中的情况：会有EventTime低于水位线的数据被抛弃。例如在下图中stream最新的event时间戳为16，会被抛弃，因为小于W(17)
+
+<img src="./image-20200706153000431.png" alt="image-20200706153000431" style="zoom:50%;" />
+
+- 注意：EventTime通常情况下由source创建或从上一个operator中继承。
+
+## 1.10 并行流中的WaterMarks
+
+- WaterMarks通常是source生成，也可以由source后的算子生成，每个subtask会独立生成WaterMarks
+- WaterMarks通过operator时，operator会推进EventTime的值，生成新的WaterMarks，同时为下游operator生成新的WaterMarks值。
+- 多输入的operator（例如join，union，keyBy）的EventTime是所有输入的EventTime最小值
+
+<img src="./image-20200706154416461.png" alt="image-20200706154416461" style="zoom:50%;" />
+
+## 1.11 延迟处理
+
+延迟处理机制，允许当EventTime小于WaterMarks时，依旧触发计算，但时间不宜太长，
 
 ## 1.8 Stateful Operations
 
@@ -681,7 +751,7 @@ Please see [operators](https://ci.apache.org/projects/flink/flink-docs-release-1
 | **WindowAll** <br />DataStream→AllWindowedStream             | 窗口函数，作用同window。windowAll会把所有的event放到一个task中。<br />`dataStream.windowAll(TumblingEventTimeWindows.of(Time.seconds(5)));   ` |
 | **Window Apply** <br />WindowedStream → DataStream AllWindowedStream→DataStream | apply方法给window函数添加用户自定义的逻辑，如果是WindowAll，则需实现AllWindowFunction。<br /><img src="./image-20200703145256874.png" alt="image-20200703145256874" style="zoom:100%;" /> |
 | **Window Apply** <br />WindowedStream → DataStream AllWindowedStream→DataStream | apply方法给window函数添加用户自定义的逻辑，如果是WindowAll，则需实现AllWindowFunction。<br /><img src="./image-20200703145256874.png" alt="image-20200703145256874" style="zoom:100%;" /> |
-| **Window Reduce** WindowedStream → DataStream                | 将reduce函数作用于窗口，返回一个reduce的值。<br />windowedStream.reduce (<br />new ReduceFunction<Tuple2<String,Integer>>() {<br />  public Tuple2<String, Integer> reduce(Tuple2<String, Integer> value1, Tuple2<String, Integer> value2) throws Exception {        <br />    return new Tuple2<String,Integer>(value1.f0, value1.f1 + value2.f1);    <br />} <br />}); |
+| **Window Reduce** WindowedStream → DataStream                | 将reduce函数作用于窗口，返回一个reduce的值。<br />![image-20200706164432587](./image-20200706164432587.png) |
 | **Window Fold**<br />WindowedStream → DataStream             | 将fold函数作用于window    `                                  |
 | **Aggregations on windows** WindowedStream → DataStream      | 作用于窗口函数的函数，min和minBy的区别是，min只返回最小值，minBy返回最小值那一整条记录<br />`windowedStream.sum(0);`<br />`windowedStream.sum("key")`;<br />`windowedStream.min(0);`<br />`windowedStream.min("key");`<br />` windowedStream.max(0);<br />`<br />`windowedStream.max("key");<br />`<br />`windowedStream.minBy(0);` <br />`windowedStream.minBy("key"); `<br />`windowedStream.maxBy(0); `<br />`windowedStream.maxBy("key");    ` |
 | **Union** <br />DataStream* → DataStream                     | 把两个或更多DataStream的数据union到一起，如果union自己，数据会重复。<br />`dataStream.union(otherStream1, otherStream2, ...);    ` |
@@ -737,5 +807,167 @@ stillGreaterZero.print();
 env.execute("test Iterator");
 ```
 
-### 3.4.6 WaterMarks
+### 3.4.6 Window
+
+1. 所有流的编程套路
+
+- Keyed Windows
+
+```
+stream
+       .keyBy(...)               <-  keyed versus non-keyed windows
+       .window(...)              <-  required: "assigner"
+      [.trigger(...)]            <-  optional: "trigger" (else default trigger)
+      [.evictor(...)]            <-  optional: "evictor" (else no evictor)
+      [.allowedLateness(...)]    <-  optional: "lateness" (else zero)
+      [.sideOutputLateData(...)] <-  optional: "output tag" (else no side output for late data)
+       .reduce/aggregate/fold/apply()      <-  required: "function"
+      [.getSideOutput(...)]      <-  optional: "output tag"
+```
+
+- Non-Keyed Windows
+
+```
+stream
+       .windowAll(...)           <-  required: "assigner"
+      [.trigger(...)]            <-  optional: "trigger" (else default trigger)
+      [.evictor(...)]            <-  optional: "evictor" (else no evictor)
+      [.allowedLateness(...)]    <-  optional: "lateness" (else zero)
+      [.sideOutputLateData(...)] <-  optional: "output tag" (else no side output for late data)
+       .reduce/aggregate/fold/apply()      <-  required: "function"
+      [.getSideOutput(...)]      <-  optional: "output tag"
+```
+
+
+
+1. Tumbling Windows
+
+```java
+DataStream<T> input = ...;
+
+// tumbling event-time windows
+input
+    .keyBy(<key selector>)
+    .window(TumblingEventTimeWindows.of(Time.seconds(5)))
+    .<windowed transformation>(<window function>);
+
+// daily tumbling event-time windows offset by -8 hours.
+input
+    .keyBy(<key selector>)
+    .window(TumblingEventTimeWindows.of(Time.days(1), Time.hours(-8)))
+    .<windowed transformation>(<window function>);
+```
+
+2. Sliding Windows
+
+```java
+DataStream<T> input = ...;
+
+// sliding event-time windows
+input
+    .keyBy(<key selector>)
+    .window(SlidingEventTimeWindows.of(Time.seconds(10), Time.seconds(5)))
+    .<windowed transformation>(<window function>);
+
+// sliding processing-time windows
+input
+    .keyBy(<key selector>)
+    .window(SlidingProcessingTimeWindows.of(Time.seconds(10), Time.seconds(5)))
+    .<windowed transformation>(<window function>);
+
+// sliding processing-time windows offset by -8 hours
+input
+    .keyBy(<key selector>)
+    .window(SlidingProcessingTimeWindows.of(Time.hours(12), Time.hours(1), Time.hours(-8)))
+    .<windowed transformation>(<window function>);
+```
+
+3. Globle Windows
+
+```java
+ataStream<T> input = ...;
+
+input
+    .keyBy(<key selector>)
+    .window(GlobalWindows.create())
+    .trigger(Customer Trigger)
+    .<windowed transformation>(<window function>);
+```
+
+4. Windows Function
+
+- ReduceFunction：见[3.4.5 Operator章节]()
+-  AggregateFunction：求各班级平均分
+
+```java
+@Test
+public void windowAggregateFunction() throws Exception {
+
+  env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+  System.out.println(System.currentTimeMillis());
+  DataStreamSource<Tuple4<Long, String, String, Double>> source =
+    env.fromElements(
+    new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "张三", "class1", 100.0),
+    new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "李四", "class2", 96.0),
+    new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "王五", "class1", 90.0),
+    new Tuple4<Long, String, String, Double>(System.currentTimeMillis(), "赵六", "class1", 60.0),
+    new Tuple4<Long, String, String, Double>(System.currentTimeMillis()+10000, "王八", "class1", 71.0)
+  );
+
+  DataStream<Double> classAvgScore =
+    source
+    .assignTimestampsAndWatermarks(new wmAssigner())
+    .keyBy(2)
+    .window(TumblingEventTimeWindows.of(Time.seconds(1)))
+    .aggregate(new AggregateFunction<Tuple4<Long, String, String, Double>, Tuple2<Double, Double>, Double>() {
+      @Override
+      public Tuple2<Double, Double> createAccumulator() {
+        return new Tuple2<Double, Double>(0.0, 0.0);
+      }
+
+      @Override
+      public Tuple2<Double, Double> add(Tuple4<Long, String, String, Double> value, Tuple2<Double, Double> accumulator) {
+        return new Tuple2<Double, Double>(accumulator.f0 + value.f3, accumulator.f1 + 1);
+      }
+
+      @Override
+      public Double getResult(Tuple2<Double, Double> accumulator) {
+        return accumulator.f0 / accumulator.f1;
+      }
+
+      @Override
+      public Tuple2<Double, Double> merge(Tuple2<Double, Double> a, Tuple2<Double, Double> b) {
+        return new Tuple2<Double, Double>(a.f0 + b.f0, a.f1 + b.f1);
+      }
+    });
+
+  classAvgScore.print();
+
+  env.execute("class avg");
+}
+
+class wmAssigner implements AssignerWithPeriodicWatermarks<Tuple4<Long, String, String, Double>> {
+
+
+    private final long maxOutOfOrderness = 3000; // 10 seconds
+
+    private long currentMaxTimestamp;
+
+    @Nullable
+    @Override
+    public Watermark getCurrentWatermark() {
+        return new Watermark(currentMaxTimestamp - maxOutOfOrderness);
+    }
+
+    @Override
+    public long extractTimestamp(Tuple4<Long, String, String, Double> element, long previousElementTimestamp) {
+        long eventTime = element.f0;
+        currentMaxTimestamp = Math.max(element.f0, currentMaxTimestamp);
+        return eventTime;
+    }
+}
+```
+
+### 3.4.6 Event Time & WaterMarks & Lateness
 
