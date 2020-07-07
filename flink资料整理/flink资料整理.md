@@ -1845,3 +1845,135 @@ public class MysqlSource extends RichSourceFunction<HashMap<String, Tuple2<Strin
     }
 }
 ```
+
+### 3.6.9 异步io
+
+flink提供了异步io的apiAsyncDataStream.unorderedWait()
+
+```java
+/**
+ * Add an AsyncWaitOperator. The order of output stream records may be reordered.
+ *
+ * @param in 输入流
+ * @param func 自定义异步的function
+ * @param timeout 超时时间
+ * @param timeUnit timeout的单位
+ * @param capacity 可以触发的异步I / O操作的最大数量
+ * @param <IN> Type of input record
+ * @param <OUT> Type of output record
+ * @return A new {@link SingleOutputStreamOperator}.
+ */
+public static <IN, OUT> SingleOutputStreamOperator<OUT> unorderedWait(
+      DataStream<IN> in,
+      AsyncFunction<IN, OUT> func,
+      long timeout,
+      TimeUnit timeUnit,
+      int capacity) {
+   return addOperator(in, func, timeUnit.toMillis(timeout), capacity, OutputMode.UNORDERED);
+}
+```
+
+示例：异步读取mysql
+
+```java
+@Test
+public void testAsynMysql() throws Exception {
+
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+    DataStream<String> instream = env.socketTextStream("localhost", 9000, "\n");
+
+    DataStream<String> process =
+        instream
+            .map(new MapFunction<String, Tuple2<Long, String>>() {
+                @Override
+                public Tuple2<Long, String> map(String s) throws Exception {
+
+                    String[] splited = s.split(",");
+                    return new Tuple2<Long, String>(Long.parseLong(splited[0]), splited[1]);
+                }
+            })
+            .assignTimestampsAndWatermarks(new MyWatermarkerAssigner())
+            .keyBy(new KeySelector<Tuple2<Long,String>, String>() {
+                @Override
+                public String getKey(Tuple2<Long, String> longStringTuple2) throws Exception {
+                    return longStringTuple2.f1;
+                }
+            })
+            .window(TumblingProcessingTimeWindows.of(Time.seconds(10)))
+            .process(new ProcessWindowFunction<Tuple2<Long, String>, String, String, TimeWindow>() {
+                @Override
+                public void process(String s, Context context, Iterable<Tuple2<Long, String>> elements,
+                                    Collector<String> out) throws Exception {
+
+                    Iterator<Tuple2<Long, String>> itr = elements.iterator();
+                    while (itr.hasNext()){
+                        out.collect(itr.next().f1);
+                    }
+                }
+            });
+
+    DataStream<String> asynprocess =
+            AsyncDataStream.unorderedWait(process, new MysqlAsynFunction(),
+                10000, TimeUnit.MILLISECONDS, 100);
+
+    asynprocess.map(new MapFunction<String, String>() {
+        @Override
+        public String map(String value) throws Exception {
+            System.out.println(value);
+            return value;
+        }
+    });
+
+    env.execute("test asyn");
+
+}
+```
+
+
+用户自定义异步function，继承RichAsyncFunction
+
+```java
+public class MysqlAsynFunction extends RichAsyncFunction<String, String> {
+
+    static ComboPooledDataSource dataSource;
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        super.open(parameters);
+        dataSource = new ComboPooledDataSource();
+        dataSource.setJdbcUrl("jdbc:mysql://127.0.0.1:3306/test");
+        try {
+            dataSource.setDriverClass("com.mysql.jdbc.Driver");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        dataSource.setUser("root");
+        dataSource.setPassword("root");
+    }
+
+    @Override
+    public void close() throws Exception {
+        super.close();
+    }
+
+    @Override
+    public void asyncInvoke(String input, ResultFuture<String> resultFuture) throws Exception {
+
+        Connection conn = dataSource.getConnection();
+        PreparedStatement pst = conn.prepareStatement("SELECT id,name,age FROM account WHERE id=1");
+        ResultSet rs = pst.executeQuery();
+        List<String> info = new ArrayList<>();
+        if(rs.next()){
+            int id = rs.getInt("id");
+            String name = rs.getString("name");
+            info.add(input + " : " + id + "_" + name);
+            System.out.println(input + " : " + id + "_" + name);
+        }
+        resultFuture.complete(info);
+
+    }
+}
+```
+
