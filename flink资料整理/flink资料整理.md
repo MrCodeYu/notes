@@ -421,6 +421,34 @@ The exact data structures in which the key/values indexes are stored depends on 
 
 3. savepoint是特殊的checkpoint，不会过期，不会覆盖，除非手动删除。
 
+## 1.16 connector（source/sink）
+
+1. flink预定义的，一般用于测试
+2. 捆绑的connector
+3. apache bahir
+4. 自定义source
+
+- 实现SourceFunction（并行度1）
+- 实现ParallelSourceFunction（并行）
+- 继承RichParallelSourceFunction
+
+5. 并行化自定义ParallelSourceFunction
+
+- 实现ParallelSourceFunction或继承RichParallelSourceFunction
+- 实现切分数据逻辑
+- 实现CheckpointedFunction接口，保证容错
+- Source拥有回溯读取，减少状态保存
+
+## 1.17 state、checkpoint、savepoint
+
+1. 状态：某个task/operator在某个时刻的属性的值
+2. checpoint：在某个时刻的job的全局快照，包含所有operator在那个时刻的状态
+3. 状态的作用
+
+- 滚动计算（比如reduceFunction），机器学习迭代模型
+
+- 容错：基于checkpoint/savepoint的Job故障重启；基于savepoint的升级
+
 
 
 # 2. Flink运行时架构
@@ -998,7 +1026,7 @@ env.execute("test Iterator");
 
 ### 3.4.6 Window
 
-#### 1. 所有流的编程套路
+#### 3.4.6.1. 所有流的编程套路
 
 - Keyed Windows
 
@@ -1029,7 +1057,7 @@ stream
 
 
 
-#### 2. Tumbling Windows
+#### 3.4.6.2. Tumbling Windows
 
 ```java
 DataStream<T> input = ...;
@@ -1047,7 +1075,7 @@ input
     .<windowed transformation>(<window function>);
 ```
 
-#### 3. Sliding Windows
+#### 3.4.6.3. Sliding Windows
 
 ```java
 DataStream<T> input = ...;
@@ -1071,7 +1099,7 @@ input
     .<windowed transformation>(<window function>);
 ```
 
-#### 4. Globle Windows
+#### 3.4.6.4. Globle Windows
 
 ```java
 ataStream<T> input = ...;
@@ -1083,7 +1111,7 @@ input
     .<windowed transformation>(<window function>);
 ```
 
-#### 5. Windows Function
+#### 3.4.6.5. Windows Function
 
 - ReduceFunction：
 
@@ -1200,7 +1228,7 @@ class wmAssigner implements AssignerWithPeriodicWatermarks<Tuple4<Long, String, 
 }
 ```
 
-#### 6. ProcessWindowFunction
+#### 3.4.6.6. ProcessWindowFunction
 
 ```java
 @Test
@@ -1247,7 +1275,7 @@ public void testProcessWindowFunction() throws Exception {
 }
 ```
 
-#### 7. ProcessWindowFunction和ReduceFunction/AggregateFunction混合使用
+#### 3.4.6.7. ProcessWindowFunction和ReduceFunction/AggregateFunction混合使用
 
 混合使用的意义：ProcessWindowFunction会将整个窗口所有的数据汇总到一起统一计算；在混合使用时，所有的数据现在ReduceFunction/AggregateFunction先计算一次，再将结果给ProcessWindowFunction。这样的优点在于ReduceFunction/AggregateFunction属于滚动计算，效率比全量数据汇总计算要高得多，再将汇总后的小数据给ProcessWindowFunction，很大程度减小了计算量，提高性能。
 
@@ -1320,7 +1348,7 @@ class MyProcessWindowFunction extends ProcessWindowFunction<Double, Tuple2<Strin
 }
 ```
 
-#### 8. 各种window算法的比较
+#### 3.4.6.8. 各种window算法的比较
 
 | Function                                       | 优点 | 缺点 |
 | ---| ------------------- | ------------------- |
@@ -1331,7 +1359,7 @@ class MyProcessWindowFunction extends ProcessWindowFunction<Double, Tuple2<Strin
 | processWindowFunction/processAllWindowFunction | 场景全面，可以拿到窗口中所有数据，并且可以拿到context | 同上 |
 | processWindowFunction和前三混用            | 兼具高效和全面 |      |
 
-#### 9. window join
+#### 3.4.6.9. window join
 
 window join会把两个同时间段的两个window，按照相同的key进行join。用户需要自定义JoinFunction/FlatJoinFunction。
 
@@ -1404,7 +1432,7 @@ public void testWindowJoin() throws Exception {
 }
 ```
 
-#### 10. Window coGroup
+#### 3.4.6.10. Window coGroup
 
 - window cogroup 的基本套路
 
@@ -1490,9 +1518,183 @@ public void testCogroup() throws Exception {
 }
 ```
 
+### 3.4.7 processFunction&CoProcessFunction
+
+**processFunction**是低阶时间处理算子，可以操纵状态、定时器等，可以把它理解成可以操纵状态的flatMapFunction。
+
+（1）event：事件
+
+（2）state：容错性、一致性，只在keyed stream
+
+（3）timer：定时器，只在keyed stream生效。Timer由TimerService持有，每个key只持有一个Timer，重复的会被删除。如果一个key注册多个Timer，只有一个会在onTimer()调用
+
+注意：
+
+- 不是processWindowFunction
+- processElement()和onTimer()是同步调用的，所以不用担心状态不同步的问题
+- Timer具有容错能力，和application一起被checkpoint。故障发生后可以直接从savepoint恢复，timer会被还原
+- Timer不宜过多，会造成性能瓶颈
+
+Timer的合并
+
+对于1秒（事件或处理时间）的计时器分辨率，可以将目标时间舍入为整秒。 不用每条都生成，可以每秒生成一个Timer
+
+```java
+long coalescedTime = ((ctx.timestamp() + timeout) / 1000) * 1000;
+ctx.timerService().registerProcessingTimeTimer(coalescedTime);
+```
+
+也可以跟着watermarks生成（因为watermark只在窗口结束后调用）
+
+```java
+long coalescedTime = ctx.timerService().currentWatermark() + 1;
+ctx.timerService().registerEventTimeTimer(coalescedTime);
+```
+
+删除Timer
+
+```java
+long timestampOfTimerToStop = ...
+ctx.timerService().deleteProcessingTimeTimer(timestampOfTimerToStop);
+ctx.timerService().deleteEventTimeTimer(timestampOfTimerToStop);
+```
+
+示例：示例中3秒生成一条用户操作记录，在用户超过9秒没有操作后，计算用户总共操作的次数。以keyed stream为例，例子中用KeyedProcessFunction。
+
+```java
+public class TestProcessFunction {
+
+    public static void main(String[] args) throws Exception {
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+        DataStream<OptLogs> stream = env.addSource(new SimpleSourceFunction())
+          .assignTimestampsAndWatermarks(new AscendingTimestampExtractor<OptLogs>() {
+            @Override
+            public long extractAscendingTimestamp(OptLogs element) {
+              return element.opts;
+            }
+          });
+        stream.print();
+
+        DataStream<Tuple2<String, Long>> result =
+            stream
+            .keyBy(new KeySelector<OptLogs, String>() {
+                @Override
+                public String getKey(OptLogs value) throws Exception {
+                    return value.userName;
+                }
+            }).process(new KeyedProcessFunction<String, OptLogs, Tuple2<String, Long>>() {
+
+                /** 管理当前key（用户）的状态 */
+                private ValueState<CountWithTimestamp> state;
+
+                /** 从open中获取state */
+                @Override
+                public void open(Configuration parameters) throws Exception {
+                    state = getRuntimeContext().getState(new ValueStateDescriptor<>("my_state", CountWithTimestamp.class));
+                }
+
+                @Override
+                public void processElement(OptLogs value, Context ctx, Collector<Tuple2<String, Long>> out) throws Exception {
+                    CountWithTimestamp current = state.value();
+                    if (current == null) {
+                        current = new CountWithTimestamp();
+                        current.key = value.userName;
+                    }
+                    current.count += 1;
+                    current.lastModified = System.currentTimeMillis();
+                    state.update(current);
+                    ctx.timerService().registerEventTimeTimer(current.lastModified + 9000);
+                }
+
+                @Override
+                public void onTimer(long timestamp, OnTimerContext ctx, Collector<Tuple2<String, Long>> out) throws Exception {
+                    CountWithTimestamp current = state.value();
+                    if ((current.lastModified + 9000) == timestamp) {
+                        out.collect(new Tuple2<String, Long>(current.key, current.count));
+                    }
+                }
+            });
+
+        result.print();
+
+        env.execute("run process function");
 
 
-### 3.4.7 Event Time & WaterMarks & Lateness
+    }
+
+    @Getter
+    @Setter
+    @ToString
+    public static class OptLogs {
+        // 用户名
+        private String userName;
+        // 操作类型
+        private int optType;
+        // 时间戳
+        private long opts;
+
+        public OptLogs(String userName, int optType, long opts) {
+            this.userName = userName;
+            this.optType = optType;
+            this.opts = opts;
+        }
+    }
+
+    /**
+     * state中存的数据
+     * key：OptLogs.userName
+     * count: 操作次数
+     * lastModified：最后一次操作时间
+     */
+    public static class CountWithTimestamp {
+        public String key;
+        public long count;
+        public long lastModified;
+    }
+
+    public static final String[] nameArray = new String[] {
+            "张三",
+            "李四",
+            "王五",
+            "赵六",
+            "钱七"
+    };
+
+    private static class SimpleSourceFunction implements SourceFunction<OptLogs>{
+
+        private long num = 0L;
+        private volatile boolean isRunning = true;
+
+        @Override
+        public void run(SourceContext<OptLogs> ctx) throws Exception {
+            while (isRunning){
+                int randomNum = (int)(Math.random() * 5);
+                OptLogs optLog = new OptLogs(nameArray[randomNum], randomNum, System.currentTimeMillis());
+                ctx.collect(optLog);
+                Thread.sleep(3000);
+            }
+        }
+
+        @Override
+        public void cancel() {
+            isRunning = false;
+        }
+    }
+}
+```
+
+**coProcessFunction**可以实现低阶的join（像map side join）。coProcessFunction操纵两个流，有两个独立的processElement1(...)和processElement2(...)。
+
+可以用以下方式实现低阶join：
+
+- 给输入创建state（两个都可以给状态）
+- 当接收到新数据时，更新状态
+- 当一个流接收到event时，到另一个流的状态中去找匹配的数据
+
+### 3.4.8 Event Time & WaterMarks & Lateness
 
 ```java
 public class MyWatermarks {
@@ -1624,7 +1826,7 @@ public class MyWatermarks {
 }
 ```
 
-### 3.6.8 利用broadcast state动态获取数据
+### 3.6.9 利用broadcast state动态获取数据
 
 主类，数据源读取，创建广播流、时间流，连接广播流-时间流。
 
@@ -1850,9 +2052,35 @@ public class MysqlSource extends RichSourceFunction<HashMap<String, Tuple2<Strin
 }
 ```
 
-### 3.6.9 异步io
+### 3.6.10 异步io
 
-flink提供了异步io的apiAsyncDataStream.unorderedWait()
+1. 异步io的先决条件
+
+- 数据库客户端本身支持异步操作
+- 数据库客户端本身不支持的情况下，可以用创建多个客户端，线程池同步处理调用，转变成并发客户端。
+- 数据库本身支持异步操作的性能比第二种更优
+
+2. 结果的顺序
+
+由于异步请求，返回结果的顺序和请求的顺序经常不同，flink提供两种控制结果顺序的方式：
+
+- Unorder：异步io中，接收到返回结果立即发出。AsyncDataStream.unorderedWait(...)
+- Ordered： 结果记录的发送顺序与异步请求的触发顺序相同（operator输入记录的顺序）。内部，对所有返回结果缓存，直到之前的结果发出或超时为止。 这通常会带来一些额外的延迟和checkpoint的开销，因为与无序模式相比，记录或结果在checkpoint状态下的保存时间更长。 在此模式下使用AsyncDataStream.orderedWait（...）。
+
+3. event time的顺序
+
+event time因为有watermarks，所以以下两种模式：
+
+- **Unordered**：watermarks不会先于比他早的记录发出，意味着watermarks建立了顺序的边界。unordered代表了两个watermarks之间的event可以无序，但两个watermarks的数据是有序的。
+- **Ordered**：watermarks和event都是有顺序的，和processing time处理时间没有大差异
+
+4. 注意
+
+- **AsyncFunction**:AsyncFunction不能多线程调用，它实际上只有一个实例，在内部是通过stream的各个分区依次调用它。
+
+示例：以AsyncDataStream.unorderedWait()为例
+
+- streamdemo里redis的异步有问题，以本例的写法为准
 
 ```java
 /**
@@ -1936,7 +2164,7 @@ public void testAsynMysql() throws Exception {
 ```
 
 
-用户自定义异步function，继承RichAsyncFunction
+用户自定义异步function，继承RichAsyncFunction。以client不支持异步为例，放入线程池.
 
 ```java
 public class MysqlAsynFunction extends RichAsyncFunction<String, String> {
@@ -1962,20 +2190,57 @@ public class MysqlAsynFunction extends RichAsyncFunction<String, String> {
         super.close();
     }
 
+  /**
+   * input是另一个stream的给这个流的输入
+   */
     @Override
     public void asyncInvoke(String input, ResultFuture<String> resultFuture) throws Exception {
 
-        Connection conn = dataSource.getConnection();
-        PreparedStatement pst = conn.prepareStatement("SELECT id,name,age FROM account WHERE id=1");
-        ResultSet rs = pst.executeQuery();
-        List<String> info = new ArrayList<>();
-        if(rs.next()){
-            int id = rs.getInt("id");
-            String name = rs.getString("name");
-            info.add(input + " : " + id + "_" + name);
-            System.out.println(input + " : " + id + "_" + name);
-        }
-        resultFuture.complete(info);
+        /**
+         * 用executorService实现
+         */
+        executorService.submit(new Runnable() {
+            @Override
+            public void run() {
+                try{
+                    Connection conn = dataSource.getConnection();
+                    PreparedStatement pst = conn.prepareStatement("SELECT id,name,age FROM account WHERE id=" + input);
+                    ResultSet rs = pst.executeQuery();
+                    StringBuilder info = new StringBuilder("");
+                    if(rs.next()){
+                        int id = rs.getInt("id");
+                        String name = rs.getString("name");
+                        info.append(id).append("_").append(name);
+                    }
+                    resultFuture.complete(Collections.singleton(info.toString()));
+                }catch (Exception e){
+                    e.printStackTrace();
+                }
+            }
+        });
+
+        /**
+         * 用CompletableFuture实现
+         */
+        /**
+         *
+        CompletableFuture.supplyAsync(new Supplier<String>() {
+            @SneakyThrows
+            @Override
+            public String get() {
+                Connection conn = dataSource.getConnection();
+                PreparedStatement pst = conn.prepareStatement("SELECT id,name,age FROM account WHERE id=" + input);
+                ResultSet rs = pst.executeQuery();
+                StringBuilder info = new StringBuilder("");
+                if(rs.next()){
+                    int id = rs.getInt("id");
+                    String name = rs.getString("name");
+                    info.append(id).append("_").append(name);
+                }
+                return info.toString();
+            }
+        }).thenAccept((String dbResult) -> resultFuture.complete(Arrays.asList(dbResult)));
+         */
 
     }
 }
