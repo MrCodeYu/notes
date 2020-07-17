@@ -367,27 +367,252 @@ flink watermark和allowed lateness的触发机制
 
 ## 1.13 Stateful Operations
 
-1. 状态
+1. 状态：某个task/operator在某个时刻的属性的值
+2. checpoint：在某个时刻的job的全局快照，包含所有operator在那个时刻的状态
+3. 状态的作用
 
-state一般指具体的task/operator的状态
+- 滚动计算（比如reduceFunction），机器学习迭代模型
 
-2. Operator state
+- 容错：基于checkpoint/savepoint的Job故障重启；基于savepoint的升级
 
-某个operator处理到数据的状态，每个并发都有自己的状态
+4. operator state
 
-3. Keyed state
+- 每个operator的并行实例都有自己的state，和key无关
 
-基于KeyedStream上的状态。这个状态和key绑定，对keyedstream每个key都有一个state
+- 支持：
 
-4. 原始状态和托管状态
+  (1) ListState<T>
 
-待后面补充
+  (2) BroadcastState
+
+- 例如map算子，并行度为3，那么就有3个operator state
+
+- state redistribute
+
+  (1) ListState
+
+  所有state平均分给新的task。在并行度改变的时候，会把所有task的ListState取出来，合并到一个新的list，在把新的list的state平均分配到新的task
+
+  <img src="./image-20200714102539501.png" alt="image-20200714102539501" style="zoom:50%;" />
+
+  (2) UnionListState
+
+  所有state全部分给新的task。在并行度改变的时候，会把所有task的ListState取出来，合并到一个新的list，全部给用户
+
+  <img src="/Users/yuxiang/Library/Application Support/typora-user-images/image-20200714102722023.png" alt="image-20200714102722023" style="zoom:50%;" />
+
+  (3) BroadcastState
+
+  所有task的state都是一样的，新的task获得state的一个备份
+
+  <img src="./image-20200714102843843.png" alt="image-20200714102843843" style="zoom:50%;" />
+
+5. keyed state
+
+- keyed state是keyby之后算子，即keyedStream上的function/operator里使用的
+
+- 每个key都有一个state
+
+- 例如：一个并行度为3的keyed operator有多少个state？答：和3没关系，有多少key有多少state
+
+- 支持：
+
+  (1) ValueState<T> 只维护一个值
+
+  (2) ListState<T> add(T),update(T),get(T),clear(T) 保留一组元素
+
+  (3) ReduceState<T> add(T)，只持有一个state，这个值是所有的state的汇总值。该接口类似于ListState，但是使用add（T）添加的元素使用指定的ReduceFunction缩减为一个聚合。
+
+  (4) AggregateState<IN,OUT> add(IN)，只持有一个state，这个值是所有的state的汇总值。
+
+  (5) MapState<UK, UV> 
+
+  保存一个映射列表，put(UK, UV),putAll(Map<UK, UV>),get(UK),entries(),keys(),values(),isEmpty()
+
+  (6) 所有的state都有clear()
+
+- 获取状态
+
+  (1) 创建StateDescriptor，根据获取状态的类型，有ValueStateDescriptor, ListStateDescriptor, ReducingStateDescriptor, MapStateDescriptor
+
+  (2) 通过rich function的`RuntimeContext`获取状态
+
+  `ValueState<T> getState(ValueStateDescriptor<T>)`
+
+  `ReducingState<T> getReducingState(ReducingStateDescriptor<T>)`
+
+  `ListState<T> getListState(ListStateDescriptor<T>)`
+
+  `AggregatingState<IN, OUT> getAggregatingState(AggregatingStateDescriptor<IN, ACC, OUT>)`
+
+  `MapState<UK, UV> getMapState(MapStateDescriptor<UK, UV>)`
+
+- TTL
+
+  设置TTL需要先设置StateTtlConfig：
+
+  ```java
+  StateTtlConfig ttlConfig = StateTtlConfig
+      .newBuilder(Time.seconds(1))
+      .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+      .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+      .build();
+      
+  ValueStateDescriptor<String> stateDescriptor = new ValueStateDescriptor<>("text state", String.class);
+  stateDescriptor.enableTimeToLive(ttlConfig);
+  ```
+
+  (1) TTL updateType：TTL的更新时间
+
+  `StateTtlConfig.UpdateType.OnCreateAndWrite` - 创建时更新
+
+  `StateTtlConfig.UpdateType.OnReadAndWrite` - 读时更新
+
+  (2) TTL StateVisibility：state可见性配置如果尚未清除过期值，则是否在读取访问时返回该过期值
+
+  `StateTtlConfig.StateVisibility.NeverReturnExpired` - 用不返回过期值
+
+  `StateTtlConfig.StateVisibility.ReturnExpiredIfNotCleanedUp` - 可以返回过期但没删除的值
+
+  (3) cleanup过期state
+
+  默认情况下，过期state在下次读取时会被删除
+
+  - disableCleanupInBackground() 永不删除过期state（没用）
+
+  - ##### Cleanup in full snapshot
+
+  在checkpoint 保存状态snapshot时激活清除操作，减小快照大小。 在checkpoint时不会清除本地状态，在从snapshot还原时，不会包含过期的state。 在incremental checkpointing的RocksDB state backend中不可用。
+
+  ```java
+  import org.apache.flink.api.common.state.StateTtlConfig;
+  StateTtlConfig ttlConfig = StateTtlConfig
+      .newBuilder(Time.seconds(1))
+      .disableCleanupInBackground()
+      .build();
+  ```
+
+  - ##### Incremental cleanup
+
+  逐步触发某些状态的清除。 触发器可以是来自每个状态访问或/和每个记录处理的回调。 当清除策略启用时，storage backend会保留一个惰性全局迭代器。 每次Incremental cleanup清理时，检查遍历的状态条目，并清理过期的条目。
+
+  ```java
+  import org.apache.flink.api.common.state.StateTtlConfig;
+   StateTtlConfig ttlConfig = StateTtlConfig
+      .newBuilder(Time.seconds(1))
+      .cleanupIncrementally(10, true)
+      .build();
+  ```
+
+  此策略有两个参数。 第一个是每个cleanup检查的条目数量， 每个状态访问时触发。 第二个参数定义是否在每个记录处理中额外触发清理。 堆后端的默认后台清理会检查5个条目，而每个记录处理不会进行清理。
+
+  注意：
+
+  - 如果对该状态没有访问权限或未处理任何记录，则过期状态将继续存在。
+  - 用于增量清理的时间会增加记录处理的延迟。
+  - 目前，仅对堆状态后端实施增量清理。 为RocksDB设置它不会起作用。
+  - 如果将堆状态后端与同步快照一起使用，则全局迭代器将在迭代时保留所有键的副本，这是因为其特定的实现不支持并发修改。启用此功能将增加内存消耗。 异步快照没有此问题。
+  - 对于现有作业，可以在StateTtlConfig中随时激活或取消激活此清理策略，例如 从保存点重新启动后。
+
+  (4) Cleanup during RocksDB compaction
+
+  如果使用RocksDB state backend，则将调用Flink特定的压缩过滤器进行后台清理。 RocksDB定期运行异步压缩以合并状态更新并减少存储。 Flink压缩过滤器使用TTL检查状态条目的过期时间戳，并删除过期值。
+
+  ```java
+  import org.apache.flink.api.common.state.StateTtlConfig;
+  
+  StateTtlConfig ttlConfig = StateTtlConfig
+      .newBuilder(Time.seconds(1))
+      .cleanupInRocksdbCompactFilter(1000)
+      .build();
+  ```
+
+  RocksDB压缩过滤器每次处理一定数量的状态条目后，都会从Flink查询当前时间戳来检查到期时间。 将自定义值传递给StateTtlConfig.newBuilder（...）可以改变条目数量，更频繁地更新时间戳可以提高清除速度，但由于使用本地代码中的JNI调用，因此会降低压缩性能。 每次处理1000个条目时，RocksDB后端的默认后台清理都会查询当前时间戳。
+
+  您可以通过激活FlinkCompactionFilter的调试级别，从RocksDB筛选器的本机代码激活调试日志：
+
+  log4j.logger.org.rocksdb.FlinkCompactionFilter = DEBUG
+
+6. broadcast state
+
+- Broadcast-side有read-write权限，而non-broadcast只有read-only权限。原因是flink没有跨task通信，因此为了保证所有operator的并行实例中广播状态相同，只给Broadcast-side提供读写权限
+
+- DataStream connect BroadcastStream 会形成BroadcastConnectedStream，对它调用process()需要实现CoProcessFunction，在里面写处理逻辑
+
+  （1）如果是keyed，KeyedBroadcastProcessFunction
+
+  （2）非keyed，BroadcastProcessFunction
+
+- BaseBroadcastProcessFunction和KeyedBroadcastProcessFunction
+
+```java
+public abstract class BroadcastProcessFunction<IN1, IN2, OUT> extends BaseBroadcastProcessFunction {
+
+    public abstract void processElement(IN1 value, ReadOnlyContext ctx, Collector<OUT> out) throws Exception;
+
+    public abstract void processBroadcastElement(IN2 value, Context ctx, Collector<OUT> out) throws Exception;
+}
+```
+
+```java
+public abstract class KeyedBroadcastProcessFunction<KS, IN1, IN2, OUT> {
+
+    public abstract void processElement(IN1 value, ReadOnlyContext ctx, Collector<OUT> out) throws Exception;
+
+    public abstract void processBroadcastElement(IN2 value, Context ctx, Collector<OUT> out) throws Exception;
+
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<OUT> out) throws Exception;
+}
+```
+
+从方法中可以看到，broadcast side process方法有Context，而non-broadcast side只有ReadOnlyContext，印证了上面的结论
 
 5. state backend
 
-The exact data structures in which the key/values indexes are stored depends on the chosen [state backend](https://ci.apache.org/projects/flink/flink-docs-release-1.10/ops/state/state_backends.html). One state backend stores data in an in-memory hash map, another state backend uses [RocksDB](http://rocksdb.org/) as the key/value store. In addition to defining the data structure that holds the state, the state backends also implement the logic to take a point-in-time snapshot of the key/value state and store that snapshot as part of a checkpoint.
-
 <img src="./image-20200630103236640.png" alt="image-20200630103236640" style="zoom:50%;" />
+
+flink提供三种state backend：*MemoryStateBackend*（默认）、*FsStateBackend*、*RocksDBStateBackend*
+
+（1）*MemoryStateBackend*
+
+state存储在内存中，在checkpoint时，*MemoryStateBackend*会把snapshot当作消息发送给JobManager，JobManager会把状态存在堆内存中。建议启用异步checkpoint（默认开启，避免阻塞），启用时为true。
+
+```java
+new MemoryStateBackend(MAX_MEM_STATE_SIZE, false);
+```
+
+限制：
+
+- 单个状态不可大于5M，可配置，但不可大于单个akka消息大小（10M）
+- JobManager必须有足够大小的内存
+
+什么时候用：
+
+- 调试程序时
+- job几乎没有大的状态，例如job由map、flatmap、filter这些算子组成
+
+（2）FsStateBackend
+
+FsStateBackend将正在处理的数据保存在TaskManager的内存中。 checkpoint时，它将状态snapshot写入文件系统目录中，再把元数据发给JobManager，存储在JobManager的内存中（或在高可用性模式下，存储在元数据检查点中）。依然建议启用异步，启用时为true
+
+```java
+new FsStateBackend(path, false);
+```
+
+什么时候用
+
+- 状态较大，窗口较长，键/值状态较大的作业。
+- 所有高可用性设置。
+
+（3）RocksDBStateBackend
+
+将运行中的数据保存在RocksDB数据库中的TaskManager的文件目录下。在checkpoint时，整个RocksDB数据库会被checkpoint到配置的文件系统和目录，然后把原数据给JobManager。支持异步不可设置，且始终是异步
+
+适用范围
+
+- 超大状态、超长窗口
+- 支持增量checkpoint：增量checkpoint和全量checkpoint相比会大大减小生成快照时间，因为它只记录增量变化的数据。历史的增量checkpoint不会无限制增长，会自动的清除旧的checkpoint。
+- 默认情况下，会把RocksDB的内存会被分配在TaskManager的内存中
 
 
 
@@ -395,11 +620,61 @@ The exact data structures in which the key/values indexes are stored depends on 
 
 1. checkpoint
 
-在某个时刻，将所有task的状态做快照，存储到state backend
+   在某个时刻，将所有operator的并行化实例的状态做snapshot，存储到state backend，用于故障恢复。Checkpoints可以让flink从流中恢复状态和event的位置。
 
-2. 轻量级容错
-3. 保证exactly-once
-4. 用于内部失败的恢复
+2. 先决条件
+
+- 可持久化的数据源，可回溯数据，例如 Apache Kafka, RabbitMQ, Amazon Kinesis, Google PubSub
+- 可永久存储状态的存储系统，一般是分布式文件系统，例如 HDFS, S3, GFS, NFS, Ceph
+
+3. 配置checkpoint
+
+   通过StreamExecutionEnvironment.enableCheckpointing(n)启用checkpoint，n表示checkpoint间隔时间
+
+- *exactly-once vs. at-least-once*：
+- *checkpoint timeout*:当checkpoint超过超市时间未完成，会放弃
+- *minimum time between checkpoints*：本次checkpoint结束到下一次checkpoint开始的中间时间最小间隔
+- *number of concurrent checkpoints*: 如果是异步checkpoint，同时允许几个checkpoint
+- *externalized checkpoints*:将checkpoint保存在外部存储，配置在job失败后是否删除
+- *fail/continue task on checkpoint errors*: 配置当checkpoint失败后，job是否继续
+- *prefer checkpoint for recovery*: 当job有更近的savepoint的时候，是否还是用checkpoint进行恢复
+
+```java
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+// start a checkpoint every 1000 ms
+env.enableCheckpointing(1000);
+
+// advanced options:
+
+// set mode to exactly-once (this is the default)
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+
+// make sure 500 ms of progress happen between checkpoints
+env.getCheckpointConfig().setMinPauseBetweenCheckpoints(500);
+
+// checkpoints have to complete within one minute, or are discarded
+env.getCheckpointConfig().setCheckpointTimeout(60000);
+
+// allow only one checkpoint to be in progress at the same time
+env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+
+// enable externalized checkpoints which are retained after job cancellation
+env.getCheckpointConfig().enableExternalizedCheckpoints(ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+
+// allow job recovery fallback to checkpoint when there is a more recent savepoint
+env.getCheckpointConfig().setPreferCheckpointForRecovery(true);
+
+// enables the experimental unaligned checkpoints
+env.getCheckpointConfig.enableUnalignedCheckpoints();
+```
+
+4. 选择State Backend
+
+   flink的checkpoint机制会snapshot所有的算子state，包括connector、windows、用户自定义state。状态存在哪里取决于state.backend的配置（conf/flink-conf.yaml）。
+
+   默认情况下，state保存在Taskmanager中，而checkpoints保存在JobManager中。为了保证更大的state能够存储，flink支持其他的state backend，通过配置StreamExecutionEnvironment.setStateBackend(…)。
+
 5. 基本原理
 
 -  source注入barrier
@@ -438,16 +713,6 @@ The exact data structures in which the key/values indexes are stored depends on 
 - 实现切分数据逻辑
 - 实现CheckpointedFunction接口，保证容错
 - Source拥有回溯读取，减少状态保存
-
-## 1.17 state、checkpoint、savepoint
-
-1. 状态：某个task/operator在某个时刻的属性的值
-2. checpoint：在某个时刻的job的全局快照，包含所有operator在那个时刻的状态
-3. 状态的作用
-
-- 滚动计算（比如reduceFunction），机器学习迭代模型
-
-- 容错：基于checkpoint/savepoint的Job故障重启；基于savepoint的升级
 
 
 
@@ -1826,232 +2091,6 @@ public class MyWatermarks {
 }
 ```
 
-### 3.6.9 利用broadcast state动态获取数据
-
-主类，数据源读取，创建广播流、时间流，连接广播流-时间流。
-
-```java
-@Test
-public void testBroadcastState() throws Exception {
-
-    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
-
-    // timestamp,id 事件流
-    DataStreamSource<String> customInStream = env.socketTextStream("localhost", 9999);
-
-    // custom data Tuple2<Long, String>
-    SingleOutputStreamOperator<Tuple2<Long, String>> customProcessStream =
-        customInStream.process(new ProcessFunction<String, Tuple2<Long, String>>() {
-            @Override
-            public void processElement(String customData, Context ctx,
-                                       Collector<Tuple2<Long, String>> out) throws Exception {
-
-                String[] splited = customData.split(",");
-                out.collect(new Tuple2<Long, String>(Long.parseLong(splited[0]), splited[1]));
-            }
-        });
-
-    // mysql data Tuple2<String, Integer>
-    DataStreamSource<HashMap<String, Tuple2<String, Integer>>> mysqlStream =
-            env.addSource(new MysqlSource());
-    mysqlStream.print();
-
-    /*
-      (1) 先建立MapStateDescriptor
-      MapStateDescriptor定义了状态的名称、Key和Value的类型。
-      这里，MapStateDescriptor中，key是Void类型，value是Map<String, Tuple2<String,Integer>>类型。
-
-      是mysql data的类型
-     */
-    MapStateDescriptor<Void, Map<String, Tuple2<String, Integer>>> configDescriptor =
-            new MapStateDescriptor<>("config", Types.VOID,
-                    Types.MAP(Types.STRING, Types.TUPLE(Types.STRING, Types.INT)));
-
-    /*
-      (2) 将mysql的数据流广播，形成BroadcastStream，并添加上mysql data的类型
-     */
-    BroadcastStream<HashMap<String, Tuple2<String, Integer>>> broadcastConfigStream =
-            mysqlStream.broadcast(configDescriptor);
-
-    //(3)事件流和广播的配置流连接，形成BroadcastConnectedStream
-    BroadcastConnectedStream<Tuple2<Long, String>, HashMap<String, Tuple2<String, Integer>>> connectedStream =
-            customProcessStream.connect(broadcastConfigStream);
-
-    //(4)对BroadcastConnectedStream应用process方法，根据配置(规则)处理事件
-    SingleOutputStreamOperator<Tuple4<Long, String, String, Integer>> resultStream =
-            connectedStream.process(new CustomBroadcastProcessFunction());
-
-    resultStream.print();
-
-    env.execute("testBroadcastState");
-
-}
-```
-
-广播流
-```java
-public class CustomBroadcastProcessFunction extends
-        BroadcastProcessFunction<Tuple2<Long, String>,
-                HashMap<String, Tuple2<String, Integer>>,
-                Tuple4<Long, String, String, Integer>> {
-
-    /**定义MapStateDescriptor*/
-    MapStateDescriptor<Void, Map<String, Tuple2<String,Integer>>> configDescriptor =
-            new MapStateDescriptor<>("config", Types.VOID,
-                    Types.MAP(Types.STRING, Types.TUPLE(Types.STRING, Types.INT)));
-
-    /**
-     * 读取状态，并基于状态，处理事件流中的数据
-     * 在这里，从上下文中获取状态，基于获取的状态，对事件流中的数据进行处理
-     * @param value 事件流中的数据
-     * @param ctx 上下文
-     * @param out 输出零条或多条数据
-     * @throws Exception
-     */
-    @Override
-    public void processElement(Tuple2<Long, String> value, ReadOnlyContext ctx,
-                               Collector<Tuple4<Long, String, String, Integer>> out) throws Exception {
-
-        //nc -l 中的用户ID
-        String userID = value.f1;
-        System.out.println("userid: " + userID);
-
-        //获取状态-mysql
-        ReadOnlyBroadcastState<Void, Map<String, Tuple2<String, Integer>>> broadcastState =
-                ctx.getBroadcastState(configDescriptor);
-        Map<String, Tuple2<String, Integer>> mysqlDataInfo = broadcastState.get(null);
-        System.out.println("广播内容： " + mysqlDataInfo);
-
-        //配置中有此用户，则在该事件中添加用户的userName、userAge字段。
-        //配置中没有此用户，则丢弃
-        Tuple2<String, Integer> userInfo = mysqlDataInfo.get(userID);
-        System.out.println(mysqlDataInfo);
-        if(userInfo!=null){
-            out.collect(new Tuple4<>(value.f0, value.f1, userInfo.f0, userInfo.f1));
-        }else{
-            System.out.println("没有该用户 " + userID);
-        }
-
-    }
-
-    /**
-     * 处理广播流中的每一条数据，并更新状态
-     * @param value 广播流中的数据
-     * @param ctx 上下文
-     * @param out 输出零条或多条数据
-     * @throws Exception
-     */
-    @Override
-    public void processBroadcastElement(HashMap<String, Tuple2<String, Integer>> value, Context ctx, Collector<Tuple4<Long, String, String, Integer>> out) throws Exception {
-
-        // 获取状态
-        BroadcastState<Void, Map<String, Tuple2<String, Integer>>> broadcastState = ctx.getBroadcastState(configDescriptor);
-
-        //清空状态
-        broadcastState.clear();
-
-        //更新状态
-        broadcastState.put(null,value);
-    }
-}
-```
-
-Customer MySQL source stream
-
-```java
-public class MysqlSource extends RichSourceFunction<HashMap<String, Tuple2<String, Integer>>> {
-
-    private String jdbcUrl = "jdbc:mysql://127.0.0.1:3306/test";
-    private String user = "root";
-    private String passwd = "root";
-    private Integer secondInterval = 5;
-
-    private Connection conn = null;
-    private PreparedStatement pst1 = null;
-    private PreparedStatement pst2 = null;
-
-    private boolean isRunning = true;
-    private boolean isFirstTime = true;
-
-    public MysqlSource(){}
-
-    public MysqlSource(String jdbcUrl, String user, String passwd,Integer secondInterval) {
-        this.jdbcUrl = jdbcUrl;
-        this.user = user;
-        this.passwd = passwd;
-        this.secondInterval = secondInterval;
-    }
-
-    @Override
-    public void open(Configuration parameters) throws Exception {
-        super.open(parameters);
-        Class.forName("com.mysql.jdbc.Driver");
-        conn = DriverManager.getConnection(jdbcUrl, user, passwd);
-
-    }
-
-    @Override
-    public void run(SourceContext<HashMap<String, Tuple2<String, Integer>>> out) throws Exception {
-        String staticStatusSql = "SELECT up_status FROM my_status";
-        String sql = "SELECT id,name,age FROM account";
-
-        pst1 = conn.prepareStatement(staticStatusSql);
-        pst2 = conn.prepareStatement(sql);
-
-        HashMap<String, Tuple2<String, Integer>> mysqlData = new HashMap();
-
-        while (isRunning){
-
-            ResultSet rs1 = pst1.executeQuery();
-            Boolean isUpdateStatus = false;
-            while(rs1.next()){
-                isUpdateStatus = (rs1.getInt("up_status") == 1);
-            }
-            System.out.println();
-            System.out.println("isUpdateStatus:  " + isUpdateStatus + " isFirstTime: " + isFirstTime);
-
-            if(isUpdateStatus || isFirstTime){
-                ResultSet rs2 = pst2.executeQuery();
-                while(rs2.next()){
-                    int id = rs2.getInt("id");
-                    String name = rs2.getString("name");
-                    int age = rs2.getInt("age");
-                    mysqlData.put(id + "", new Tuple2<String, Integer>(name, age));
-                }
-                isFirstTime = false;
-                System.out.println("我查了一次mysql，数据是： " + mysqlData);
-                out.collect(mysqlData);
-            }else{
-                System.out.println("这次没查mysql");
-            }
-
-            Thread.sleep(secondInterval * 1000);
-        }
-    }
-
-    @Override
-    public void cancel() {
-
-        isRunning = false;
-    }
-
-    @Override
-    public void close() throws Exception {
-        super.close();
-        if(conn != null){
-            conn.close();
-        }
-        if(pst1 != null){
-            pst1.close();
-        }
-        if(pst2 != null){
-            pst2.close();
-        }
-    }
-}
-```
-
 ### 3.6.10 异步io
 
 1. 异步io的先决条件
@@ -2246,3 +2285,308 @@ public class MysqlAsynFunction extends RichAsyncFunction<String, String> {
 }
 ```
 
+### 3.6.11 operator state\keyed state\broadcast state
+
+#### 3.6.11.1 operator state
+
+```java
+/**
+ *
+ * 想知道两次事件1之间，一共发生多少次其他事件，分别是什么事件
+ *
+ * 事件流：1 2 3 4 5 1 3 4 5 6 7 1 4 5 3 9 9 2 1...
+ * 输出：
+ *      (4,2 3 4 5)
+ *      (5,3 4 5 6 7)
+ *      (6,4 5 6 9 9 2)
+ */
+public class CountWithFunction extends RichFlatMapFunction<Integer, Tuple2<Integer, String>> implements CheckpointedFunction {
+
+    /**
+     * 托管状态
+     */
+    private transient ListState<Integer> checkpointCountList;
+
+    /**
+     * 原始状态
+     */
+    private List<Integer> rawState;
+
+    @Override
+    public void flatMap(Integer value, Collector<Tuple2<Integer, String>> out) throws Exception {
+
+        if(value == 1){
+            if(rawState.size() > 0){
+                StringBuilder builder = new StringBuilder();
+                for(Integer element: rawState){
+                    builder.append(element + " ");
+                }
+                out.collect(new Tuple2<>(rawState.size(), builder.toString()));
+                rawState.clear();
+            }
+        }else {
+            rawState.add(value);
+        }
+    }
+
+    @Override
+    public void snapshotState(FunctionSnapshotContext context) throws Exception {
+        checkpointCountList.clear();
+        checkpointCountList.addAll(rawState);
+    }
+
+    @Override
+    public void initializeState(FunctionInitializationContext context) throws Exception {
+
+        ListStateDescriptor<Integer> checkpointCountListDesc =
+                new ListStateDescriptor<>("checkpointCountListDesc", TypeInformation.of(new TypeHint<Integer>() {}));
+        checkpointCountList = context.getOperatorStateStore().getListState(checkpointCountListDesc);
+        if(context.isRestored()){
+            for(Integer element: checkpointCountList.get()){
+                rawState.add(element);
+            }
+        }
+
+    }
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        rawState = new ArrayList<>();
+    }
+}
+```
+
+#### 3.6.11.2 broadcast state动态获取数据
+
+（1）创建事件流 non-broadcast side
+
+（2）创建广播流 broadcast side
+
+（3）(non-broadcast side).connect(broadcast side)得到BroadcastConnectedStream
+
+（4）BroadcastConnectedStream.process(KeyedBroadcastProcessFunction/BroadcastProcessFunction)
+
+```java
+@Test
+public void testBroadcastState() throws Exception {
+
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+    // timestamp,id 事件流
+    DataStreamSource<String> customInStream = env.socketTextStream("localhost", 9999);
+
+    // custom data Tuple2<Long, String>
+    SingleOutputStreamOperator<Tuple2<Long, String>> customProcessStream =
+        customInStream.process(new ProcessFunction<String, Tuple2<Long, String>>() {
+            @Override
+            public void processElement(String customData, Context ctx,
+                                       Collector<Tuple2<Long, String>> out) throws Exception {
+
+                String[] splited = customData.split(",");
+                out.collect(new Tuple2<Long, String>(Long.parseLong(splited[0]), splited[1]));
+            }
+        });
+
+    // mysql data Tuple2<String, Integer>
+    DataStreamSource<HashMap<String, Tuple2<String, Integer>>> mysqlStream =
+            env.addSource(new MysqlSource());
+    mysqlStream.print();
+
+    /*
+      (1) 先建立MapStateDescriptor
+      MapStateDescriptor定义了状态的名称、Key和Value的类型。
+      这里，MapStateDescriptor中，key是Void类型，value是Map<String, Tuple2<String,Integer>>类型。
+
+      是mysql data的类型
+     */
+    MapStateDescriptor<Void, Map<String, Tuple2<String, Integer>>> configDescriptor =
+            new MapStateDescriptor<>("config", Types.VOID,
+                    Types.MAP(Types.STRING, Types.TUPLE(Types.STRING, Types.INT)));
+
+    /*
+      (2) 将mysql的数据流广播，形成BroadcastStream，并添加上mysql data的类型
+     */
+    BroadcastStream<HashMap<String, Tuple2<String, Integer>>> broadcastConfigStream =
+            mysqlStream.broadcast(configDescriptor);
+
+    //(3)事件流和广播的配置流连接，形成BroadcastConnectedStream
+    BroadcastConnectedStream<Tuple2<Long, String>, HashMap<String, Tuple2<String, Integer>>> connectedStream =
+            customProcessStream.connect(broadcastConfigStream);
+
+    //(4)对BroadcastConnectedStream应用process方法，根据配置(规则)处理事件
+    SingleOutputStreamOperator<Tuple4<Long, String, String, Integer>> resultStream =
+            connectedStream.process(new CustomBroadcastProcessFunction());
+
+    resultStream.print();
+
+    env.execute("testBroadcastState");
+
+}
+```
+
+广播流
+
+```java
+public class CustomBroadcastProcessFunction extends
+        BroadcastProcessFunction<Tuple2<Long, String>,
+                HashMap<String, Tuple2<String, Integer>>,
+                Tuple4<Long, String, String, Integer>> {
+
+    /**定义MapStateDescriptor*/
+    MapStateDescriptor<Void, Map<String, Tuple2<String,Integer>>> configDescriptor =
+            new MapStateDescriptor<>("config", Types.VOID,
+                    Types.MAP(Types.STRING, Types.TUPLE(Types.STRING, Types.INT)));
+
+    /**
+     * 读取状态，并基于状态，处理事件流中的数据
+     * 在这里，从上下文中获取状态，基于获取的状态，对事件流中的数据进行处理
+     * @param value 事件流中的数据
+     * @param ctx 上下文
+     * @param out 输出零条或多条数据
+     * @throws Exception
+     */
+    @Override
+    public void processElement(Tuple2<Long, String> value, ReadOnlyContext ctx,
+                               Collector<Tuple4<Long, String, String, Integer>> out) throws Exception {
+
+        //nc -l 中的用户ID
+        String userID = value.f1;
+        System.out.println("userid: " + userID);
+
+        //获取状态-mysql
+        ReadOnlyBroadcastState<Void, Map<String, Tuple2<String, Integer>>> broadcastState =
+                ctx.getBroadcastState(configDescriptor);
+        Map<String, Tuple2<String, Integer>> mysqlDataInfo = broadcastState.get(null);
+        System.out.println("广播内容： " + mysqlDataInfo);
+
+        //配置中有此用户，则在该事件中添加用户的userName、userAge字段。
+        //配置中没有此用户，则丢弃
+        Tuple2<String, Integer> userInfo = mysqlDataInfo.get(userID);
+        System.out.println(mysqlDataInfo);
+        if(userInfo!=null){
+            out.collect(new Tuple4<>(value.f0, value.f1, userInfo.f0, userInfo.f1));
+        }else{
+            System.out.println("没有该用户 " + userID);
+        }
+
+    }
+
+    /**
+     * 处理广播流中的每一条数据，并更新状态
+     * @param value 广播流中的数据
+     * @param ctx 上下文
+     * @param out 输出零条或多条数据
+     * @throws Exception
+     */
+    @Override
+    public void processBroadcastElement(HashMap<String, Tuple2<String, Integer>> value, Context ctx, Collector<Tuple4<Long, String, String, Integer>> out) throws Exception {
+
+        // 获取状态
+        BroadcastState<Void, Map<String, Tuple2<String, Integer>>> broadcastState = ctx.getBroadcastState(configDescriptor);
+
+        //清空状态
+        broadcastState.clear();
+
+        //更新状态
+        broadcastState.put(null,value);
+    }
+}
+```
+
+Customer MySQL source stream
+
+```java
+public class MysqlSource extends RichSourceFunction<HashMap<String, Tuple2<String, Integer>>> {
+
+    private String jdbcUrl = "jdbc:mysql://127.0.0.1:3306/test";
+    private String user = "root";
+    private String passwd = "root";
+    private Integer secondInterval = 5;
+
+    private Connection conn = null;
+    private PreparedStatement pst1 = null;
+    private PreparedStatement pst2 = null;
+
+    private boolean isRunning = true;
+    private boolean isFirstTime = true;
+
+    public MysqlSource(){}
+
+    public MysqlSource(String jdbcUrl, String user, String passwd,Integer secondInterval) {
+        this.jdbcUrl = jdbcUrl;
+        this.user = user;
+        this.passwd = passwd;
+        this.secondInterval = secondInterval;
+    }
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        super.open(parameters);
+        Class.forName("com.mysql.jdbc.Driver");
+        conn = DriverManager.getConnection(jdbcUrl, user, passwd);
+
+    }
+
+    @Override
+    public void run(SourceContext<HashMap<String, Tuple2<String, Integer>>> out) throws Exception {
+        String staticStatusSql = "SELECT up_status FROM my_status";
+        String sql = "SELECT id,name,age FROM account";
+
+        pst1 = conn.prepareStatement(staticStatusSql);
+        pst2 = conn.prepareStatement(sql);
+
+        HashMap<String, Tuple2<String, Integer>> mysqlData = new HashMap();
+
+        while (isRunning){
+
+            ResultSet rs1 = pst1.executeQuery();
+            Boolean isUpdateStatus = false;
+            while(rs1.next()){
+                isUpdateStatus = (rs1.getInt("up_status") == 1);
+            }
+            System.out.println();
+            System.out.println("isUpdateStatus:  " + isUpdateStatus + " isFirstTime: " + isFirstTime);
+
+            if(isUpdateStatus || isFirstTime){
+                ResultSet rs2 = pst2.executeQuery();
+                while(rs2.next()){
+                    int id = rs2.getInt("id");
+                    String name = rs2.getString("name");
+                    int age = rs2.getInt("age");
+                    mysqlData.put(id + "", new Tuple2<String, Integer>(name, age));
+                }
+                isFirstTime = false;
+                System.out.println("我查了一次mysql，数据是： " + mysqlData);
+                out.collect(mysqlData);
+            }else{
+                System.out.println("这次没查mysql");
+            }
+
+            Thread.sleep(secondInterval * 1000);
+        }
+    }
+
+    @Override
+    public void cancel() {
+
+        isRunning = false;
+    }
+
+    @Override
+    public void close() throws Exception {
+        super.close();
+        if(conn != null){
+            conn.close();
+        }
+        if(pst1 != null){
+            pst1.close();
+        }
+        if(pst2 != null){
+            pst2.close();
+        }
+    }
+}
+```
+
+### 
