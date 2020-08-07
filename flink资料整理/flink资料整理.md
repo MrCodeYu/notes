@@ -714,7 +714,243 @@ env.getCheckpointConfig.enableUnalignedCheckpoints();
 - 实现CheckpointedFunction接口，保证容错
 - Source拥有回溯读取，减少状态保存
 
+## 1.17 数据分流 Side Outputs
 
+1. 功能
+
+将输入的流按OutputTag拆分为多个流，详细内容见代码实例
+
+## 1.18 flink 1.11中的blink planner和older planner（1.9之前）
+
+1. 两种planner的区别
+
+- Blink Planner把batch当作特殊的流，所以不支持table和dataset的转换，只支持table和datastream的转换。dataset的程序会被转化成datastream
+- Blink计划程序不支持BatchTableSource，使用有限的StreamTableSource代替。
+- 一些仅作用于Blink的配置项（参考 [Configuration](https://ci.apache.org/projects/flink/flink-docs-release-1.11/dev/table/config.html)）
+- 两个Planner的PlannerConfig的实现（CalciteConfig）不同。
+- Blink Planner在TableEnvironment和StreamTableEnvironment上会把multiple-sinks优化为一个DAG；Older Planner将始终将每个sink优化为一个新的DAG，其中所有DAG彼此独立。
+- older Planner不支持catalog statistics（catalog 统计），Blink Planner支持
+
+2. TableEnvironment的作用
+
+- 将Table注册到catalog
+- 注册catalogs
+- 加载可插拔模块（pluggable modules）
+- 执行SQL查询
+- 注册UDF（scalar, table, or aggregation）
+- 将DataStream和DataSet变成Table
+- 持有ExecutionEnvironment和StreamExecutionEnvironment引用
+
+## 1.19 flink 1.11 的动态表 Dynamic Tables
+
+动态表由连续查询（*Continuous Query*）生成，一次连续查询在语义上等同于再一次快照上执行batch查询操作。
+
+<img src="./image-20200807090512375.png" alt="image-20200807090512375" style="zoom:50%;" />
+
+- 流将转换为动态表。
+- 在动态表上进行连续查询，生成一个新的动态表。
+- 生成的动态表将转换回流。
+
+### 1.19.1 关于append-only和updated table
+
+- 关于updated table
+
+<img src="./image-20200807091227579.png" alt="image-20200807091227579" style="zoom:30%;" />
+
+详细步骤：
+
+（1）clicks进[Mary, ./home] -> 动态表 insert [Mary, 1]
+
+（2）clicks进[Bob, ./cart]  -> 动态表 insert [Bob, 1]
+
+（3）clicks进[Mary, ./prod?id=1]  -> 动态表 update [Mary, 1]成[Mary, 2]
+
+（4）clicks进[Liz, ./home]  ->  动态表 insert [Liz, 1]
+
+注意：这个例子中，有insert 和 update
+
+- 关于append-only table
+
+<img src="./image-20200807091939290.png" alt="image-20200807091939290" style="zoom:30%;" />
+
+详细步骤：
+
+（1）触发timestamps (`cTime`) between `12:00:00` and `12:59:59`，result insert [Mary,13:00:00,3],[Bob,13:00:00,1]
+
+（2）触发timestamps (`cTime`) between `13:00:00` and `13:59:59`， result insert [Bob,14:00:00,1],[Liz,14:00:00,2]
+
+（2）触发timestamps (`cTime`) between `14:00:00` and `14:59:59`， result insert [Mary,14:00:00,1],[Bob,14:00:00,2],[Liz,14:00:00,1]
+
+- Append-only和updated table的区别
+
+（1）updated table的例子中，会更新之前的输出，changelog由INSERT和UPDATE组成
+
+（2）append-only例子中，只会在result中追加输出，changelog由INSERT组成
+
+- 无论是Append-only和updated table都有
+
+（1）update 结果表需要维护更多的state
+
+（2）将append-only table转换为stream与将updated table转换为stream不同
+
+- 可能碰到的限制和要避免的问题
+
+在操作中，很多语义是合法的，但是因为计算成本太大无法计算，例如
+
+（1）**State Size**：持续的流计算可能包含几周、几月的数据，所以维护巨大的state，update操作需要更新之前的状态就必须维护之前所有的state，可能造成任务的失败，例如下面SQL：
+
+```sql
+SELECT user, COUNT(url)
+FROM clicks
+GROUP BY user;
+```
+
+（2）**Computing Updates**：即使只添加或更新一条输入记录，某些查询也需要重新计算和更新很大一部分输出结果行。所以，这种操作不适合进行持续查询（*continuous queries*）。例如下面SQL：
+
+```sql
+SELECT user, RANK() OVER (ORDER BY lastLogin)
+FROM (
+  SELECT user, MAX(cTime) AS lastAction FROM clicks GROUP BY user
+);
+```
+
+### 1.19.2 Table和stream的转换
+
+动态表可以像常规数据库表一样操作INSERT，UPDATE和DELETE。将动态表转换为流或将其写入外部系统时，需要对这些更改进行编码。 Flink的表格API和SQL支持三种方式来编码动态表格的更改：
+
+**Append-only stream:** 仅通过INSERT修改的dynamic table能够通过输出插入的行来转变成stream
+
+**Retract stream:** retract stream由*add messages* and *retract messages*这两种消息类型组成。dynamic table用INSERT来添加消息，DELETE来retract消息
+
+<img src="./image-20200807094944552.png" alt="image-20200807094944552" style="zoom:33%;" />
+
+**Upsert stream:**upsert stream由*upsert messages* and *delete messages*组成。变为upsert stream的动态表需要一个唯一key。通过将INSERT和UPDATE更改编码为upsert消息，将DELETE更改编码为删除消息，将具有唯一键的动态表转换为流。upsert stream和retract stream的区别在于upsert更新操作仅用一个Update操作，所以高效
+
+<img src="./image-20200807095800864.png" alt="image-20200807095800864" style="zoom:33%;" />
+
+## 1.20 flink 1.11用户自定义Source&Sink
+
+<img src="./image-20200807135159452.png" alt="image-20200807135159452" style="zoom:40%;" />
+
+1. Metadata
+
+Table&SQL API都是声明式API，包括表的创建语句， 因此，执行CREATE TABLE语句会在catalog中产生元数据。跟在WITH后的语句不预编译。Dynamic Table的元数据是CatalogTable实例。
+
+2. Planning
+
+DynamicTableSourceFactory和DynamicTableSinkFactory用于将CatalogTable的元数据解析成DynamicTableSource(for reading in a SELECT query)和DynamicTableSink(for writing in an INSERT INTO statement)的实例。绝大多数情况下，Factory用于验证参数的有效性（比如“ port” =“ 5022”）、配置encoding/decoding formats（如果需要的话）、创建参数化table connector的实例。
+
+默认情况下，使用Java’s Service Provider Interfaces（SPI）调用DynamicTableSourceFactory和DynamicTableSinkFactory的实例。所以（例如示例中的'connector'='custom'）必须有效。
+
+3. Runtime
+
+逻辑计划完成后，planner将从table connector获取runtime implementation。 运行时逻辑是在Flink的核心连接器接口（例如InputFormat或SourceFunction）中实现的。这些接口通过另一个抽象级别分组为ScanRuntimeProvider，LookupRuntimeProvider和SinkRuntimeProvider的子类。
+
+OutputFormatProvider（提供org.apache.flink.api.common.io.OutputFormat）和SinkFunctionProvider（提供org.apache.flink.streaming.api.functions.sink.SinkFunction），都是Planner可以处理的SinkRuntimeProvider的具体实例
+
+```java
+/**
+ * Defines an external stream table and provides write access to its data.
+ *
+ * @param <T> Type of the {@link DataStream} created by this {@link TableSink}.
+ */
+public interface StreamTableSink<T> extends TableSink<T> {
+
+   /**
+    * Consumes the DataStream and return the sink transformation {@link DataStreamSink}.
+    * The returned {@link DataStreamSink} will be used to set resources for the sink operator.
+    */
+   DataStreamSink<?> consumeDataStream(DataStream<T> dataStream);
+}
+```
+
+4. 以jdbc的table connector为例
+
+JdbcDynamicTableFactory类中有获取参数、参数化实例、**createDynamicTableSource**、**createDynamicTableSink**的方法。
+
+总结：Factory用于构造DynamicTableSource和DynamicTableSink
+
+```java
+public class JdbcDynamicTableFactory implements DynamicTableSourceFactory, DynamicTableSinkFactory{
+  ......
+  public DynamicTableSource createDynamicTableSource(Context context) {
+		......
+		return new JdbcDynamicTableSource(
+			getJdbcOptions(helper.getOptions()),
+			getJdbcReadOptions(helper.getOptions()),
+			getJdbcLookupOptions(helper.getOptions()),
+			physicalSchema);
+	}
+  
+  @Override
+	public DynamicTableSink createDynamicTableSink(Context context) {
+		......
+		return new JdbcDynamicTableSink(
+			jdbcOptions,
+			getJdbcExecutionOptions(config),
+			getJdbcDmlOptions(jdbcOptions, physicalSchema),
+			physicalSchema);
+	}
+  
+  ......
+}
+```
+
+而JdbcDynamicTableSource刚好是ScanTableSource, LookupTableSource, SupportsProjectionPushDown的子类，并且提供了Provider的获取方法。
+
+总结：TableSource可以同时实现ScanTableSource, LookupTableSource两个接口，Planner根据SQL来决定用哪个
+
+- ScanTableSource：需要整张表的读
+- LookupTableSource：一个不断变化或非常大的外部表，其内容通常从不完全读取，但在必要时会查询单个值
+
+```java
+public class JdbcDynamicTableSource implements ScanTableSource, LookupTableSource, SupportsProjectionPushDown {
+
+  	......
+    
+ 		public LookupRuntimeProvider getLookupRuntimeProvider(LookupContext context) {
+     		......
+        return TableFunctionProvider.of(new JdbcRowDataLookupFunction(
+          options,
+          lookupOptions,
+          physicalSchema.getFieldNames(),
+          physicalSchema.getFieldDataTypes(),
+          keyNames,
+          rowType));
+    }
+  	
+  	......
+      
+  @Override
+	@SuppressWarnings("unchecked")
+	public ScanRuntimeProvider getScanRuntimeProvider(ScanContext runtimeProviderContext) {
+      ......
+      return InputFormatProvider.of(builder.build());
+    }
+}
+```
+
+TableFunctionProvider就是用于获取TableFunction的Provider，JdbcRowDataLookupFunction刚好是TableFunction的子类。
+
+所以如果要实现source，必须实现factory、dynamicsource/dynamicsink、和TableFunction(....)
+
+DynamicTableSink过程类似，不赘述
+
+5. 关于ScanTableSource
+
+ScanTableSource会在整个执行过程中扫描所有行数据，用于读取changelog，返回changelog包含一组数据的更改。
+
+- 常规batch：输出一组有界insert-only数据
+
+- 常规stream：输出一组无界insert-only数据
+
+- change data capture (CDC) ：输出有界或无界的stream包含insert、update、delete操作
+
+- ScanTableSource的记录必须以org.apache.flink.table.data.RowData类型发出
+
+6. 关于LookupTableSource
+
+LookupTableSource在运行时通过一个或多个key查找数据，相比于ScanTableSource，它不用查找整个表，而可以通过单个key查找特定的记录，目前仅支持insert-only。他的实现有TableFunction和AsyncTableFunction... 在运行期间，将使用给定查找键的值调用该函数。
 
 # 2. Flink运行时架构
 
@@ -2091,7 +2327,7 @@ public class MyWatermarks {
 }
 ```
 
-### 3.6.10 异步io
+### 3.4.9 异步io
 
 1. 异步io的先决条件
 
@@ -2209,6 +2445,8 @@ public void testAsynMysql() throws Exception {
 public class MysqlAsynFunction extends RichAsyncFunction<String, String> {
 
     static ComboPooledDataSource dataSource;
+  
+    private transient ExecutorService executorService;
 
     @Override
     public void open(Configuration parameters) throws Exception {
@@ -2222,6 +2460,8 @@ public class MysqlAsynFunction extends RichAsyncFunction<String, String> {
         }
         dataSource.setUser("root");
         dataSource.setPassword("root");
+        // 创建 ExecutorService 对象
+        executorService = Executors.newFixedThreadPool(30);
     }
 
     @Override
@@ -2285,9 +2525,9 @@ public class MysqlAsynFunction extends RichAsyncFunction<String, String> {
 }
 ```
 
-### 3.6.11 operator state\keyed state\broadcast state
+### 3.4.10 operator state\keyed state\broadcast state
 
-#### 3.6.11.1 operator state
+#### 3.4.10.1 operator state
 
 ```java
 /**
@@ -2356,7 +2596,7 @@ public class CountWithFunction extends RichFlatMapFunction<Integer, Tuple2<Integ
 }
 ```
 
-#### 3.6.11.2 broadcast state动态获取数据
+#### 3.4.10.2 broadcast state动态获取数据
 
 （1）创建事件流 non-broadcast side
 
@@ -2589,4 +2829,78 @@ public class MysqlSource extends RichSourceFunction<HashMap<String, Tuple2<Strin
 }
 ```
 
-### 
+### 3.4.11 Side Output数据分流
+
+```java
+@Test
+public void testSideOutputData(){
+
+    final OutputTag<String> info = new OutputTag<String>("info"){};
+    final OutputTag<String> warn = new OutputTag<String>("warn"){};
+    final OutputTag<String> error = new OutputTag<String>("error"){};
+
+    DataStreamSource<String> source = env.socketTextStream("localhost", 38888);
+
+    SingleOutputStreamOperator<String> process = source.process(new ProcessFunction<String, String>() {
+        @Override
+        public void processElement(String value, Context ctx, Collector<String> out) throws Exception {
+
+            String[] splited = value.split(",");
+            if (splited[0].toLowerCase().equals("info")) {
+                ctx.output(info, splited[0] + "_mysplit" + splited[1]);
+            } else if (splited[0].toLowerCase().equals("warn")) {
+                ctx.output(warn, splited[0] + "_mysplit" + splited[1]);
+            } else if (splited[0].toLowerCase().equals("warn")) {
+                ctx.output(error, splited[0] + "_mysplit" + splited[1]);
+            } else {
+                out.collect(value);
+            }
+        }
+    });
+
+    // 获取到info流的数据
+    process.getSideOutput(info).print();
+}
+```
+
+### 3.4.12 参数处理 ParameterTool
+
+```java
+@Test
+public void handleParams() throws IOException {
+    String[] args = new String[]{};
+    // 从文件中获取
+    ParameterTool tools0 = ParameterTool.fromPropertiesFile("params.properties");
+    // 从参数中获取
+    ParameterTool tools1 = ParameterTool.fromArgs(args);
+
+    // 获取参数
+    tools1.getRequired("input");
+    tools1.get("output", "myDefaultValue");
+    tools1.getLong("expectedCount", -1L);
+    tools1.getNumberOfParameters();
+
+    // 设置Globle参数
+    env.getConfig().setGlobalJobParameters(tools1);
+}
+
+/**
+     * 获取全局参数的实例
+     */
+    class GetGlobleParam extends RichMapFunction<String, String> {
+
+        @Override
+        public String map(String value) throws Exception {
+            ParameterTool tools =
+                    (ParameterTool) getRuntimeContext().getExecutionConfig().getGlobalJobParameters();
+            tools.getRequired("input");
+            return null;
+        }
+    }
+```
+
+ 
+
+## 3.5 Table API/Table API
+
+Flink sql基于 [Apache Calcite](https://calcite.apache.org/) 。目前1.11版本的SQL和TABLE API已经实现流批统一。目前Table & SQL的planner有两种，包括1.9之前的old planner和之后的Blink planner。Planner的作用是将相关的算子变成 可执行的、优化的 Flink Job。因为两种Planner实现不同，所以只吃的功能可能有所不同。
