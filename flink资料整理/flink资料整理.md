@@ -844,7 +844,7 @@ DynamicTableSourceFactory和DynamicTableSinkFactory用于将CatalogTable的元�
 
 3. Runtime
 
-逻辑计划完成后，planner将从table connector获取runtime implementation。 运行时逻辑是在Flink的核心连接器接口（例如InputFormat或SourceFunction）中实现的。这些接口通过另一个抽象级别分组为ScanRuntimeProvider，LookupRuntimeProvider和SinkRuntimeProvider的子类。
+逻辑计划完成后，planner将从table connector获取runtime implementation。 运行时逻辑是在Flink的核心连接器接口（例如InputFormat或SourceFunction）中实现的。这些接口通过另一个抽象级别分组为ScanRuntimeProvider（子类InputFormatProvider，SourceFunctionProvider......），LookupRuntimeProvider（子类AsyncTableFunctionProvider，TableFunctionProvider ......）和SinkRuntimeProvider的子类。
 
 OutputFormatProvider（提供org.apache.flink.api.common.io.OutputFormat）和SinkFunctionProvider（提供org.apache.flink.streaming.api.functions.sink.SinkFunction），都是Planner可以处理的SinkRuntimeProvider的具体实例
 
@@ -901,7 +901,7 @@ public class JdbcDynamicTableFactory implements DynamicTableSourceFactory, Dynam
 总结：TableSource可以同时实现ScanTableSource, LookupTableSource两个接口，Planner根据SQL来决定用哪个
 
 - ScanTableSource：需要整张表的读
-- LookupTableSource：一个不断变化或非常大的外部表，其内容通常从不完全读取，但在必要时会查询单个值
+- LookupTableSource：在必要时会查询单个值
 
 ```java
 public class JdbcDynamicTableSource implements ScanTableSource, LookupTableSource, SupportsProjectionPushDown {
@@ -934,6 +934,8 @@ TableFunctionProvider就是用于获取TableFunction的Provider，JdbcRowDataLoo
 
 所以如果要实现source，必须实现factory、dynamicsource/dynamicsink、和TableFunction(....)
 
+**总结：代码流程 DynamicTableSourceFactory -> DynamicTableSource -> ScanRuntimeProvider/LookupRuntimeProvider**
+
 DynamicTableSink过程类似，不赘述
 
 5. 关于ScanTableSource
@@ -951,6 +953,47 @@ ScanTableSource会在整个执行过程中扫描所有行数据，用于读取ch
 6. 关于LookupTableSource
 
 LookupTableSource在运行时通过一个或多个key查找数据，相比于ScanTableSource，它不用查找整个表，而可以通过单个key查找特定的记录，目前仅支持insert-only。他的实现有TableFunction和AsyncTableFunction... 在运行期间，将使用给定查找键的值调用该函数。
+
+7. encoding&decoding format
+
+有的table connector因为encoding和decoding的格式不同，需要定义format。工作机制类似于DynamicTableSourceFactory-> DynamicTableSource-> ScanRuntimeProvider，factory负责家在options，source负责runtime logic。
+
+由JSP来发现fatory，需要定义唯一的factory标志。
+
+目前支持：
+
+org.apache.flink.table.factories.DeserializationFormatFactory
+org.apache.flink.table.factories.SerializationFormatFactory
+
+format factory将optinos变成EncodingFormat或DecodingFormat。这些接口是另一种针对给定数据类型生成专用格式运行时逻辑的factory。
+
+例如对于Kafka source factory，DeserializationFormatFactory将返回一个EncodingFormat <DeserializationSchema>，可以将其传递到Kafka表源中。
+
+8. 总结
+
+（1）dynamic table connector
+
+- 每个connector都有唯一标识码，在调用时在定义catalog的connector中出现。比如代码中的socket
+
+```
+CREATE TABLE UserScores (name STRING, score INT)
+WITH (
+  'connector' = 'socket',
+	......
+);
+```
+
+- connector的调用流程是（参见代码）：
+
+```txt
+DynamicTableSourceFactory子类 -> ScanTableSource/DynamicTableSource -> 输出类型（SourceFunction，TableFunction）等
+```
+
+（1）encoding/decoding
+
+```txt
+DeserializationFormatFactory子类 -> DecodingFormat<DeserializationSchema<RowData>>(类似ScanTableSource) -> DeserializationSchema<RowData>
+```
 
 # 2. Flink运行时架构
 
@@ -2904,3 +2947,431 @@ public void handleParams() throws IOException {
 ## 3.5 Table API/Table API
 
 Flink sql基于 [Apache Calcite](https://calcite.apache.org/) 。目前1.11版本的SQL和TABLE API已经实现流批统一。目前Table & SQL的planner有两种，包括1.9之前的old planner和之后的Blink planner。Planner的作用是将相关的算子变成 可执行的、优化的 Flink Job。因为两种Planner实现不同，所以只吃的功能可能有所不同。
+
+### 3.5.1 自定义connector/decoding实例
+
+1. Factory：解析connector的参数，设置解码器，创建source
+
+```java
+package connector.socket;
+
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.configuration.ConfigOption;
+import org.apache.flink.configuration.ConfigOptions;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.table.connector.format.DecodingFormat;
+import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.factories.DeserializationFormatFactory;
+import org.apache.flink.table.factories.DynamicTableFactory;
+import org.apache.flink.table.factories.DynamicTableSourceFactory;
+import org.apache.flink.table.factories.FactoryUtil;
+import org.apache.flink.table.types.DataType;
+import java.util.HashSet;
+import java.util.Set;
+
+
+/**
+ *
+ * CREATE TABLE UserScores (name STRING, score INT)
+     WITH (
+     'connector' = 'socket',
+     'hostname' = 'localhost',
+     'port' = '9999',
+     'byte-delimiter' = '10',
+     'format' = 'changelog-csv',
+     'changelog-csv.column-delimiter' = '|'
+     );
+ *
+ */
+public class SocketDynamicTableFactory implements DynamicTableSourceFactory {
+
+    public static final String IDENTIFIER = "socket";
+
+    public static final ConfigOption<String> HOSTNAME = ConfigOptions
+            .key("hostname")
+            .stringType()
+            .noDefaultValue();
+
+    public static final ConfigOption<Integer> PORT = ConfigOptions
+            .key("port")
+            .intType()
+            .noDefaultValue();
+
+    // 每一行的间隔字符
+    public static final ConfigOption<Integer> BYTE_DELEMITER = ConfigOptions
+            .key("byte-delimiter")
+            .intType()
+            .defaultValue(10);
+
+    @Override
+    public DynamicTableSource createDynamicTableSource(Context context) {
+
+        FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
+        DecodingFormat<DeserializationSchema<RowData>> decodingFormat =
+                helper.discoverDecodingFormat(DeserializationFormatFactory.class, FactoryUtil.FORMAT);
+        ReadableConfig options = helper.getOptions();
+        final String hostname = options.get(HOSTNAME);
+        final Integer port = options.get(PORT);
+        final byte byteDelemiter = (byte) (int) options.get(BYTE_DELEMITER);
+
+        DataType producedDataType = context.getCatalogTable().getSchema().toPhysicalRowDataType();
+        return new SocketDynamicTableSource(hostname, port, byteDelemiter, decodingFormat, producedDataType);
+    }
+
+    @Override
+    public String factoryIdentifier() {
+        return IDENTIFIER;
+    }
+
+    @Override
+    public Set<ConfigOption<?>> requiredOptions() {
+        Set<ConfigOption<?>> requiredOps = new HashSet<>();
+        requiredOps.add(HOSTNAME);
+        requiredOps.add(PORT);
+        requiredOps.add(FactoryUtil.FORMAT);
+        return requiredOps;
+    }
+
+    @Override
+    public Set<ConfigOption<?>> optionalOptions() {
+        Set<ConfigOption<?>> optionalOps = new HashSet<>();
+        optionalOps.add(BYTE_DELEMITER);
+        return optionalOps;
+    }
+}
+
+```
+
+2. dynamic table source
+
+在Provider中提供相应的输出类型
+
+```java
+package connector.socket;
+
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.format.DecodingFormat;
+import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.connector.source.ScanTableSource;
+import org.apache.flink.table.connector.source.SourceFunctionProvider;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.DataType;
+
+public class SocketDynamicTableSource implements ScanTableSource{
+
+    private final String hostname;
+    private final int port;
+    private final byte byteDelimiter;
+    private final DecodingFormat<DeserializationSchema<RowData>> decodingFormat;
+    private final DataType producedDataType;
+
+    public SocketDynamicTableSource(
+            String hostname,
+            int port,
+            byte byteDelimiter,
+            DecodingFormat<DeserializationSchema<RowData>> decodingFormat,
+            DataType producedDataType) {
+        this.hostname = hostname;
+        this.port = port;
+        this.byteDelimiter = byteDelimiter;
+        this.decodingFormat = decodingFormat;
+        this.producedDataType = producedDataType;
+    }
+
+    @Override
+    public DynamicTableSource copy() {
+        return new SocketDynamicTableSource(hostname, port, byteDelimiter, decodingFormat, producedDataType);
+    }
+
+    @Override
+    public String asSummaryString() {
+        return "socket connector source table";
+    }
+
+    @Override
+    public ChangelogMode getChangelogMode() {
+        return decodingFormat.getChangelogMode();
+    }
+
+    @Override
+    public ScanRuntimeProvider getScanRuntimeProvider(ScanContext runtimeProviderContext) {
+
+        final DeserializationSchema<RowData> deserializer =
+                decodingFormat.createRuntimeDecoder(runtimeProviderContext, producedDataType);
+
+        SourceFunction<RowData> socketSourceFunction =
+                new SocketSourceFunction(hostname, port, byteDelimiter, deserializer);
+
+        return SourceFunctionProvider.of(socketSourceFunction, false);
+    }
+}
+```
+
+3. sourceFunction
+
+真正的数据处理逻辑代码
+
+```java
+package connector.socket;
+
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.table.data.RowData;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+
+public class SocketSourceFunction extends RichSourceFunction<RowData> implements ResultTypeQueryable<RowData> {
+
+    private final String hostname;
+    private final int port;
+    private final byte byteDelimiter;
+    private final DeserializationSchema<RowData> deserializer;
+
+    private volatile boolean isRunning = true;
+    private Socket currentSocket;
+
+    public SocketSourceFunction(String hostname, int port, byte byteDelimiter, DeserializationSchema<RowData> deserializer) {
+
+        this.hostname = hostname;
+        this.port = port;
+        this.byteDelimiter = byteDelimiter;
+        this.deserializer = deserializer;
+    }
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        deserializer.open(() -> getRuntimeContext().getMetricGroup());
+    }
+
+    @Override
+    public void run(SourceContext<RowData> ctx) throws Exception {
+        while (isRunning) {
+            // open and consume from socket
+            try (final Socket socket = new Socket()) {
+                currentSocket = socket;
+                socket.connect(new InetSocketAddress(hostname, port), 0);
+                try (InputStream stream = socket.getInputStream()) {
+                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                    int b;
+                    while ((b = stream.read()) >= 0) {
+                        // buffer until delimiter
+                        if (b != byteDelimiter) {
+                            buffer.write(b);
+                        }
+                        // decode and emit record
+                        else {
+                            ctx.collect(deserializer.deserialize(buffer.toByteArray()));
+                            buffer.reset();
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                t.printStackTrace(); // print and continue
+            }
+            Thread.sleep(1000);
+        }
+    }
+
+    @Override
+    public void cancel() {
+        isRunning = false;
+        try {
+            currentSocket.close();
+        } catch (Throwable t) {
+            // ignore
+        }
+    }
+
+    @Override
+    public TypeInformation<RowData> getProducedType() {
+        return deserializer.getProducedType();
+    }
+}
+```
+
+4. decode factory
+
+```java
+package connector.socket.format;
+
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.configuration.ConfigOption;
+import org.apache.flink.configuration.ConfigOptions;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.table.connector.format.DecodingFormat;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.factories.DeserializationFormatFactory;
+import org.apache.flink.table.factories.DynamicTableFactory;
+import org.apache.flink.table.factories.FactoryUtil;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
+public class ChangelogCsvFormatFactory implements DeserializationFormatFactory {
+
+    public static final String IDENTIFIER = "changelog-csv";
+
+    final ConfigOption<String> COLUMNDELIMITER = ConfigOptions.key("column_delimiter")
+            .stringType()
+            .defaultValue("|");
+
+    @Override
+    public DecodingFormat<DeserializationSchema<RowData>> createDecodingFormat(
+            DynamicTableFactory.Context context,
+            ReadableConfig formatOptions) {
+        FactoryUtil.validateFactoryOptions(this, formatOptions);
+        final String columnDelimiter = formatOptions.get(COLUMNDELIMITER);
+        return new ChangelogCsvFormat(columnDelimiter);
+    }
+
+    @Override
+    public String factoryIdentifier() {
+        return IDENTIFIER;
+    }
+
+    @Override
+    public Set<ConfigOption<?>> requiredOptions() {
+        return Collections.emptySet();
+    }
+
+    @Override
+    public Set<ConfigOption<?>> optionalOptions() {
+        Set<ConfigOption<?>> optionalOps = new HashSet<>();
+        optionalOps.add(COLUMNDELIMITER);
+        return optionalOps;
+    }
+}
+```
+
+5. DecodingFormat
+
+```java
+package connector.socket.format;
+
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.format.DecodingFormat;
+import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.types.RowKind;
+
+import java.util.List;
+
+public class ChangelogCsvFormat implements DecodingFormat<DeserializationSchema<RowData>> {
+
+    private String columnDelimiter;
+
+    public ChangelogCsvFormat(String columnDelimiter) {
+        this.columnDelimiter = columnDelimiter;
+    }
+
+    @Override
+    public DeserializationSchema<RowData> createRuntimeDecoder(
+            DynamicTableSource.Context context,
+            DataType producedDataType) {
+        TypeInformation<RowData> productTypeInformation =
+                (TypeInformation<RowData>) context.createTypeInformation(producedDataType);
+        DynamicTableSource.DataStructureConverter converter =
+                context.createDataStructureConverter(producedDataType);
+        // 数据的逻辑类型
+        List<LogicalType> parsingTypes = producedDataType.getLogicalType().getChildren();
+        return new ChangelogCsvDeserializer(parsingTypes, converter, productTypeInformation, columnDelimiter);
+    }
+
+    @Override
+    public ChangelogMode getChangelogMode() {
+        return ChangelogMode.newBuilder()
+                .addContainedKind(RowKind.INSERT)
+                .addContainedKind(RowKind.DELETE)
+                .build();
+    }
+}
+```
+
+6. DeserializationSchema
+
+真正的decode逻辑代码
+
+```java
+package connector.socket.format;
+
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.connector.source.DynamicTableSource.DataStructureConverter;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
+import org.apache.flink.types.Row;
+import org.apache.flink.types.RowKind;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.regex.Pattern;
+
+public class ChangelogCsvDeserializer implements DeserializationSchema<RowData> {
+
+    private List<LogicalType> parsingTypes;
+    private DataStructureConverter converter;
+    private TypeInformation<RowData> producedTypeInformation;
+    private String columnDelimiter;
+
+    public ChangelogCsvDeserializer(
+            List<LogicalType> parsingTypes,
+            DataStructureConverter converter,
+            TypeInformation<RowData> producedTypeInformation,
+            String columnDelimiter) {
+        this.parsingTypes = parsingTypes;
+        this.converter = converter;
+        this.producedTypeInformation = producedTypeInformation;
+        this.columnDelimiter = columnDelimiter;
+    }
+
+    @Override
+    public RowData deserialize(byte[] message) throws IOException {
+        final String[] columns = new String(message).split(Pattern.quote(columnDelimiter));
+        final RowKind kind = RowKind.valueOf(columns[0]);
+        final Row row = new Row(kind, columns.length);
+        for(int i = 0; i < parsingTypes.size(); i ++){
+            row.setField(i, parse(parsingTypes.get(i).getTypeRoot(), columns[0 + i]));
+        }
+
+        return (RowData) converter.toInternal(row);
+    }
+
+    private static Object parse(LogicalTypeRoot root, String value) {
+        switch (root) {
+            case INTEGER:
+                return Integer.parseInt(value);
+            case VARCHAR:
+                return value;
+            default:
+                throw new IllegalArgumentException();
+        }
+    }
+
+    @Override
+    public boolean isEndOfStream(RowData nextElement) {
+        return false;
+    }
+
+    @Override
+    public TypeInformation<RowData> getProducedType() {
+        return producedTypeInformation;
+    }
+}
+```
