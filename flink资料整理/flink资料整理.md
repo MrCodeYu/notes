@@ -995,6 +995,461 @@ DynamicTableSourceFactory子类 -> ScanTableSource/DynamicTableSource -> 输出�
 DeserializationFormatFactory子类 -> DecodingFormat<DeserializationSchema<RowData>>(类似ScanTableSource) -> DeserializationSchema<RowData>
 ```
 
+## 1.21 flink 1.11 中时间的设置
+
+1. 在StreamExecutionEnvironment中设置
+
+```java
+final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime); // default
+
+// alternatively:
+// env.setStreamTimeCharacteristic(TimeCharacteristic.IngestionTime);
+// env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
+```
+
+2. Process Time
+
+（1）在CREATE TABLE DDL中通过 `PROCTIME()` 方法 创建
+
+```sql
+CREATE TABLE user_actions (
+  user_name STRING,
+  data STRING,
+  user_action_time AS PROCTIME() -- declare an additional field as a processing time attribute
+) WITH (
+  ...
+);
+
+SELECT TUMBLE_START(user_action_time, INTERVAL '10' MINUTE), COUNT(DISTINCT user_name)
+FROM user_actions
+GROUP BY TUMBLE(user_action_time, INTERVAL '10' MINUTE);
+```
+
+（2）在DataStream转Table时通过org.apache.flink.table.api.Expressions.proctime()方法创建
+
+```java
+DataStream<Tuple2<String, String>> stream = ...;
+
+// declare an additional logical field as a processing time attribute
+Table table = tEnv.fromDataStream(stream, $("user_name"), $("data"), $("user_action_time").proctime());
+
+WindowedTable windowedTable = table.window(
+        Tumble.over(lit(10).minutes())
+            .on($("user_action_time"))
+            .as("userActionWindow"));
+```
+
+（3）通过implements StreamTableSource<Row>, DefinedProctimeAttribute
+
+```java
+// define a table source with a processing attribute
+public class UserActionSource implements StreamTableSource<Row>, DefinedProctimeAttribute {
+
+	@Override
+	public TypeInformation<Row> getReturnType() {
+		String[] names = new String[] {"user_name" , "data"};
+		TypeInformation[] types = new TypeInformation[] {Types.STRING(), Types.STRING()};
+		return Types.ROW(names, types);
+	}
+
+	@Override
+	public DataStream<Row> getDataStream(StreamExecutionEnvironment execEnv) {
+		// create stream
+		DataStream<Row> stream = ...;
+		return stream;
+	}
+
+	@Override
+	public String getProctimeAttribute() {
+		// field with this name will be appended as a third field
+		return "user_action_time";
+	}
+}
+
+// register table source
+tEnv.registerTableSource("user_actions", new UserActionSource());
+
+WindowedTable windowedTable = tEnv
+	.from("user_actions")
+	.window(Tumble
+	    .over(lit(10).minutes())
+	    .on($("user_action_time"))
+	    .as("userActionWindow"));
+```
+
+3. Event Time
+
+（1）在CREATE TABLE DDL中通过 `WATERMARK` 声明创建
+
+```sql
+CREATE TABLE user_actions (
+  user_name STRING,
+  data STRING,
+  user_action_time TIMESTAMP(3),
+  -- declare user_action_time as event time attribute and use 5 seconds delayed watermark strategy
+  WATERMARK FOR user_action_time AS user_action_time - INTERVAL '5' SECOND
+) WITH (
+  ...
+);
+
+SELECT TUMBLE_START(user_action_time, INTERVAL '10' MINUTE), COUNT(DISTINCT user_name)
+FROM user_actions
+GROUP BY TUMBLE(user_action_time, INTERVAL '10' MINUTE);
+```
+
+（2）在DataStream转Table时通过org.apache.flink.table.api.Expressions.rowtime()方法创建
+
+条件：DataStream中已经设置了watermarks
+
+两种方法：
+
+- 增加一个新字段
+- 替换已有字段
+
+```java
+// 增加一个新字段:
+
+// 提取时间戳，并加watermarks
+DataStream<Tuple2<String, String>> stream = inputStream.assignTimestampsAndWatermarks(...);
+
+// 附加一个user_action_time的字段作为event time
+Table table = tEnv.fromDataStream(stream, $("user_name"), $("data"), $("user_action_time").rowtime()");
+
+
+// 替换已有字段:
+
+// 将第一个字段作为时间戳，并加watermarks
+DataStream<Tuple3<Long, String, String>> stream = inputStream.assignTimestampsAndWatermarks(...);
+
+// user_action_time已经不需要了，替换为event time
+Table table = tEnv.fromDataStream(stream, $("user_action_time").rowtime(), $("user_name"), $("data"));
+
+// 不管是哪种方式，使用如下:
+WindowedTable windowedTable = table.window(Tumble
+       .over(lit(10).minutes())
+       .on($("user_action_time"))
+       .as("userActionWindow"));
+```
+
+（3）通过implements StreamTableSource<Row>, DefinedRowtimeAttributes
+
+```java
+// define a table source with a rowtime attribute
+public class UserActionSource implements StreamTableSource<Row>, DefinedRowtimeAttributes {
+
+	@Override
+	public TypeInformation<Row> getReturnType() {
+		String[] names = new String[] {"user_name", "data", "user_action_time"};
+		TypeInformation[] types =
+		    new TypeInformation[] {Types.STRING(), Types.STRING(), Types.LONG()};
+		return Types.ROW(names, types);
+	}
+
+	@Override
+	public DataStream<Row> getDataStream(StreamExecutionEnvironment execEnv) {
+		// create stream
+		// ...
+		// assign watermarks based on the "user_action_time" attribute
+		DataStream<Row> stream = inputStream.assignTimestampsAndWatermarks(...);
+		return stream;
+	}
+
+	@Override
+	public List<RowtimeAttributeDescriptor> getRowtimeAttributeDescriptors() {
+		// Mark the "user_action_time" attribute as event-time attribute.
+		// We create one attribute descriptor of "user_action_time".
+		RowtimeAttributeDescriptor rowtimeAttrDescr = new RowtimeAttributeDescriptor(
+			"user_action_time",
+			new ExistingField("user_action_time"),
+			new AscendingTimestamps());
+		List<RowtimeAttributeDescriptor> listRowtimeAttrDescr = Collections.singletonList(rowtimeAttrDescr);
+		return listRowtimeAttrDescr;
+	}
+}
+
+// register the table source
+tEnv.registerTableSource("user_actions", new UserActionSource());
+
+WindowedTable windowedTable = tEnv
+	.from("user_actions")
+	.window(Tumble.over(lit(10).minutes()).on($("user_action_time")).as("userActionWindow"));
+```
+
+## 1.22 flink temporal table
+
+Temporal Tables 记录了数据在各个时间点变化的情况的视图。changing table可以是记录数据变化过程的changing history table，也可以是落地了更改数据的changing dimension table（例如数据库表）。
+
+changing history table：Flink可以记录并查询更改，也可以查询指定时间的changing history table内容。 在Flink中由*Temporal Table Function*表示
+
+对于changing dimension table，Flink允许通过processing time查询表内容。在Flink中由*Temporal Table*表示
+
+1. changing history table相关内容
+
+```sql
+SELECT * FROM RatesHistory;
+
+rowtime currency   rate
+======= ======== ======
+09:00   US Dollar   102
+09:00   Euro        114
+09:00   Yen           1
+10:45   Euro        116
+11:15   Euro        119
+11:49   Pounds      108
+
+========================
+
+SELECT *
+FROM RatesHistory AS r
+WHERE r.rowtime = (
+  SELECT MAX(rowtime)
+  FROM RatesHistory AS r2
+  WHERE r2.currency = r.currency
+  AND r2.rowtime <= TIME '10:58');
+  
+-------------------------
+
+rowtime currency   rate
+======= ======== ======
+09:00   US Dollar   102
+09:00   Yen           1
+10:45   Euro        116
+```
+
+可以看到SQL中，内部的查询语句决定在时间范围内currency相关的最大时间小于等于10:58，外层查询等于最大时间currency的currency结果。*Temporal Tables*作用于***append-only***表，在查询时间给相应时间的版本。需要主键和时间戳，主键决定哪条记录被overwrite，时间戳决定决定记录的版本。
+
+2.temporal table function
+
+temporal table必须传入时间戳，返回那个时间戳下的版本。目前temporal table不支持时间常量的查询，只支持join，例子只是为了直观学习。
+
+```sql
+SELECT * FROM Rates('10:15');
+
+rowtime currency   rate
+======= ======== ======
+09:00   US Dollar   102
+09:00   Euro        114
+09:00   Yen           1
+
+SELECT * FROM Rates('11:00');
+
+rowtime currency   rate
+======= ======== ======
+09:00   US Dollar   102
+10:45   Euro        116
+09:00   Yen           1
+```
+
+3. 自定义temporal table function
+
+```java
+import org.apache.flink.table.functions.TemporalTableFunction;
+(...)
+
+// Get the stream and table environments.
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+
+// Provide a static data set of the rates history table.
+List<Tuple2<String, Long>> ratesHistoryData = new ArrayList<>();
+ratesHistoryData.add(Tuple2.of("US Dollar", 102L));
+ratesHistoryData.add(Tuple2.of("Euro", 114L));
+ratesHistoryData.add(Tuple2.of("Yen", 1L));
+ratesHistoryData.add(Tuple2.of("Euro", 116L));
+ratesHistoryData.add(Tuple2.of("Euro", 119L));
+
+// Create and register an example table using above data set.
+// In the real setup, you should replace this with your own table.
+DataStream<Tuple2<String, Long>> ratesHistoryStream = env.fromCollection(ratesHistoryData);
+Table ratesHistory = tEnv.fromDataStream(ratesHistoryStream, $("r_currency"), $("r_rate"), $("r_proctime").proctime());
+
+tEnv.createTemporaryView("RatesHistory", ratesHistory);
+
+// 创建一个 temporal table function.
+// 定义时间戳 "r_proctime"和主键"r_currency"
+TemporalTableFunction rates = ratesHistory.createTemporalTableFunction("r_proctime", "r_currency"); // <==== (1)
+tEnv.registerFunction("Rates", rates);  
+```
+
+4. temporal table（仅支持blink）
+
+为了可以访问表，TableSource需要实现LookupableTableSource接口，在sql中可以写 FOR SYSTEM_TIME AS OF 作为查询条件
+
+```sql
+SELECT * FROM LatestRates FOR SYSTEM_TIME AS OF TIME '10:15';
+
+currency   rate
+======== ======
+US Dollar   102
+Euro        114
+Yen           1
+
+SELECT * FROM LatestRates FOR SYSTEM_TIME AS OF TIME '11:00';
+
+currency   rate
+======== ======
+US Dollar   102
+Euro        116
+Yen           1
+```
+
+5. 自定义temporal table
+
+```java
+// Get the stream and table environments.
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+EnvironmentSettings settings = EnvironmentSettings.newInstance().build();
+StreamTableEnvironment tEnv = StreamTableEnvironment.create(env, settings);
+// or TableEnvironment tEnv = TableEnvironment.create(settings);
+
+// 'currency' 是hbase表中的rowkey，在这里作为temporal table的主键
+tEnv.executeSql(
+    "CREATE TABLE LatestRates (" +
+    "   currency STRING," +
+    "   fam1 ROW<rate DOUBLE>" +
+    ") WITH (" +
+    "   'connector' = 'hbase-1.4'," +
+    "   'table-name' = 'Rates'," +
+    "   'zookeeper.quorum' = 'localhost:2181'" +
+    ")");
+```
+
+## 1.23 flink内存管理
+
+### 1.23.1 flink的内存模型
+
+<img src="./image-20200917104641716.png" alt="image-20200918085725415" style="zoom:50%;" />
+
+| **组件**                             | **TaskManager可用项**                                        | **JobManager**可用项                                         |
+| :----------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- |
+| Total Flink memory                   | [`taskmanager.memory.flink.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-flink-size) | [`jobmanager.memory.flink.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#jobmanager-memory-flink-size) |
+| Total process memory                 | [`taskmanager.memory.process.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-process-size) | [`jobmanager.memory.process.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#jobmanager-memory-process-size) |
+| Total process memory的内部组件的配置 | [`taskmanager.memory.task.heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-task-heap-size) and [`taskmanager.memory.managed.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-managed-size) | [`jobmanager.memory.heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#jobmanager-memory-heap-size) |
+
+1. 配置 total flink memory适合standalone的情况
+
+2. 配置 total process memory更适合yarn、mesos（适合外部的资源管理器），可以声明为flink jvm进程分配多少内存
+
+3. 可以显式的配置Total process memory的task heap和managed memory。、
+
+注意：如果配置了3，就不要配置1和2以免内存配置的冲突
+
+内存组件可以是包含的，例如JVM Overhead是total process memory的一部分，举几个内存分配的例子：
+
+配置1：
+
+- *total Process memory* = 1000Mb,
+- *JVM Overhead min* = 64Mb,
+- *JVM Overhead max* = 128Mb,
+- *JVM Overhead fraction* = 0.1
+
+计算出JVM Overhead = 1000MB * 0.1 = 100MB，满足64MB<JVM Overhead<128MB，所以JVM Overhead=100MB
+
+配置2:
+
+- *total Process memory* = 1000Mb,
+- *JVM Overhead min* = 128Mb,
+- *JVM Overhead max* = 256Mb,
+- *JVM Overhead fraction* = 0.1
+
+计算出JVM Overhead = 1000MB * 0.1 = 100MB，满足JVM Overhead<128MB，所以JVM Overhead=128MB
+
+配置3:
+
+- *total Process memory* = 1000Mb,
+- *task heap* = 100Mb, (similar example can be for *JVM Heap* in the JobManager)
+- *JVM Overhead min* = 64Mb,
+- *JVM Overhead max* = 256Mb,
+- *JVM Overhead fraction* = 0.1
+
+当配置了total memory的其他组件，例如*task heap* （或*Off-heap* memory in the JobManager），这时JVM Overhead就不是1000*0.1，而是total memory剩余的内存，但是必须在64MB～256MB之间，或任务失败。
+
+
+
+### 1.23.2 JVM配置项在flink中的意义
+
+| **JVM 参数**                                                 | TaskManager的值                                | **JobManager的值**       |
+| :----------------------------------------------------------- | :--------------------------------------------- | :----------------------- |
+| *-Xmx* and *-Xms*                                            | Framework + Task Heap Memory                   | JVM Heap Memory          |
+| *-XX:MaxDirectMemorySize* (always added only for TaskManager, see note for JobManager) | Framework + Task Off-heap (*) + Network Memory | Off-heap Memory (*),(**) |
+| *-XX:MaxMetaspaceSize*                                       | JVM Metaspace                                  | JVM Metaspace            |
+
+### 1.23.3 TaskManager的内存模型
+
+<img src="./image-20200918140223629.png" alt="image-20200918140223629" style="zoom:50%;" />
+
+1. 配置heap memory和managed memory
+
+（1）[`taskmanager.memory.task.heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-task-heap-size)可以显示的指定task heap memory大小，这部分内存用于执行用户代码（task）。
+
+（2）managed memory由flink管理，并分配为堆外内存。一下场景用到managed memory
+
+- 存储RocksDB state backend
+- batch job用来排序、hash table、缓存中间结果
+
+managed memory的大小：
+
+-  [`taskmanager.memory.managed.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-managed-size)显示设置
+- 通过*total Flink memory* 的 [`taskmanager.memory.managed.fraction`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-managed-fraction)计算得出
+- size会覆盖fraction的计算结果
+
+2. 配置off-heap memory
+
+通过[`taskmanager.memory.task.off-heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-task-off-heap-size)进行设置
+
+3. framework memory
+
+用于存储data structures 或 operations，不建议改
+
+4. 详细的内存设置
+
+| **Component**                                                | **Configuration options**                                    | **Description**                                              |
+| :----------------------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- |
+| [Framework Heap Memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup_tm.html#framework-memory) | [`taskmanager.memory.framework.heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-framework-heap-size) | JVM Heap memory dedicated to Flink framework (advanced option) |
+| [Task Heap Memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup_tm.html#task-operator-heap-memory) | [`taskmanager.memory.task.heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-task-heap-size) | JVM Heap memory dedicated to Flink application to run operators and user code |
+| [Managed memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup_tm.html#managed-memory) | [`taskmanager.memory.managed.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-managed-size) [`taskmanager.memory.managed.fraction`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-managed-fraction) | Native memory managed by Flink, reserved for sorting, hash tables, caching of intermediate results and RocksDB state backend |
+| [Framework Off-heap Memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup_tm.html#framework-memory) | [`taskmanager.memory.framework.off-heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-framework-off-heap-size) | [Off-heap direct (or native) memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup_tm.html#configure-off-heap-memory-direct-or-native) dedicated to Flink framework (advanced option) |
+| [Task Off-heap Memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup_tm.html#configure-off-heap-memory-direct-or-native) | [`taskmanager.memory.task.off-heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-task-off-heap-size) | [Off-heap direct (or native) memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup_tm.html#configure-off-heap-memory-direct-or-native) dedicated to Flink application to run operators |
+| Network Memory                                               | [`taskmanager.memory.network.min`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-network-min) [`taskmanager.memory.network.max`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-network-max) [`taskmanager.memory.network.fraction`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-network-fraction) | Direct memory reserved for data record exchange between tasks (e.g. buffering for the transfer over the network), it is a [capped fractionated component](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup.html#capped-fractionated-components) of the [total Flink memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup.html#configure-total-memory) |
+| [JVM metaspace](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup.html#jvm-parameters) | [`taskmanager.memory.jvm-metaspace.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-jvm-metaspace-size) | Metaspace size of the Flink JVM process                      |
+| JVM Overhead                                                 | [`taskmanager.memory.jvm-overhead.min`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-jvm-overhead-min) [`taskmanager.memory.jvm-overhead.max`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-jvm-overhead-max) [`taskmanager.memory.jvm-overhead.fraction`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-jvm-overhead-fraction) | Native memory reserved for other JVM overhead: e.g. thread stacks, code cache, garbage collection space etc, it is a [capped fractionated component](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup.html#capped-fractionated-components) of the [total process memory](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/memory/mem_setup.html#configure-total-memory) |
+
+### 1.23.4 JobManager的内存模型
+
+1. 配置JVM Heap Memory
+
+通过[jobmanager.memory.heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#jobmanager-memory-heap-size)进行配置，用于：
+
+- flink Framework
+- 在提交用户代码期间或checkpoint成功后的callback
+
+JVM Heap memory主要取决于用户代码的复杂程度。
+
+注意：如果显示设置了JVM Heap Memory，就不要设置*total process memory* 和 *total Flink memory*，容易造成内存设置冲突。
+
+2. 配置off-Heap Memory
+
+off-heap memory通过 [`jobmanager.memory.off-heap.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#jobmanager-memory-off-heap-size)进行设置，用于JVM direct memory和native memory。因此，可以通过[`jobmanager.memory.enable-jvm-direct-memory-limit`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#jobmanager-memory-enable-jvm-direct-memory-limit)设置direct memory，flink会将这个值赋给*-XX:MaxDirectMemorySize*。
+
+这部分内存用于：
+
+- Flink framework 的依赖 (e.g. Akka 网络通信)
+- 在提交用户代码期间或checkpoint成功后的callback
+
+如果已经设置了total flink memory 和 JVM heap memory，那么off-heap memory=total flink memory - JVM heap memory
+
+### 1.23.5 调优指南
+
+1. 设置container的内存（YARN、mesos）
+
+建议设置*total process memory*([`taskmanager.memory.process.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#taskmanager-memory-process-size) or [`jobmanager.memory.process.size`](https://ci.apache.org/projects/flink/flink-docs-release-1.11/ops/config.html#jobmanager-memory-process-size))，会分配指定大小的container。
+
+如果设置的是*total Flink memory*，flink因为有其他内存组件，所以flink为每个container分配的内存大于*total Flink memory*。
+
+WARN：如果分配的unmanaged off-heap (native) memory超过了container的大小，任务会被kill导致失败
+
 # 2. Flink运行时架构
 
 - client
@@ -1181,7 +1636,7 @@ class Address {
 
 在选取属性时：
 
-```
+```java
 // 以name为key
 personInfoDS.keyBy("name");
 // 以Person中Address的city为key
@@ -2944,11 +3399,21 @@ public void handleParams() throws IOException {
 
  
 
-## 3.5 Table API/Table API
+## 3.5 Table API/SQL
 
 Flink sql基于 [Apache Calcite](https://calcite.apache.org/) 。目前1.11版本的SQL和TABLE API已经实现流批统一。目前Table & SQL的planner有两种，包括1.9之前的old planner和之后的Blink planner。Planner的作用是将相关的算子变成 可执行的、优化的 Flink Job。因为两种Planner实现不同，所以只吃的功能可能有所不同。
 
-### 3.5.1 自定义connector/decoding实例
+### 3.5.1 Table API/SQL常用方法
+
+table.executeInsert
+
+tableEnv.sqlQuery
+
+tableEnv.executeSql
+
+
+
+### 3.5.2 自定义connector/decoding实例
 
 1. Factory：解析connector的参数，设置解码器，创建source
 
@@ -3375,3 +3840,33 @@ public class ChangelogCsvDeserializer implements DeserializationSchema<RowData> 
     }
 }
 ```
+
+### 3.5.3 在持续的查询中进行join
+
+1. 常规的join
+
+每当有新纪录加入，都会和之前所有记录进行join，所以两个表都会存储在Flink的state中，注意：随着时间增长，消耗的资源也会变大。
+
+常规join支持所有表类型（insert, update, delete）
+
+```sql
+SELECT * FROM Orders
+INNER JOIN Product
+ON Orders.productId = Product.id
+```
+
+2. 间隔的join interval join
+
+仅支持有时间的、append-only的表，由于时间单调增加，flink会删除旧的数据
+
+```sql
+SELECT *
+FROM
+  Orders o,
+  Shipments s
+WHERE o.id = s.orderId AND
+      o.ordertime BETWEEN s.shiptime - INTERVAL '4' HOUR AND s.shiptime
+```
+
+
+
